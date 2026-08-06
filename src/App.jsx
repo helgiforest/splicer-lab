@@ -1,13 +1,15 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, cloneElement, Children } from "react";
+import { createPortal } from "react-dom";
 import {
   defaultAdjust, isDefaultAdjust, compileAdjust, applyAdjustToRGBBuffer,
 } from "../electron/colorAdjust.mjs";
 import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp } from "../electron/stampTool.mjs";
 
 /* ============================================================
-   SPLICER — a focused photo tool (desktop build)
-   Library (Photomator-style) + best-in-class crop,
-   auto horizon leveling, and target-file-size export.
+   SPLICER LAB — a focused photo tool (desktop build)
+   Library (Photomator-style) + best-in-class crop, a full
+   develop module, clone stamp retouching, and target-file-size
+   export.
 
    Runs inside Electron (persistent library, real folders on
    disk) and falls back to pure-browser mode when the native
@@ -19,6 +21,14 @@ const photoURL = (absPath) => `photo://${encodeURIComponent(absPath)}`;
 const thumbURL = (p) => (NATIVE && p.path ? `${photoURL(p.path)}?thumb` : p.url);
 const proxyURL = (p) => (NATIVE && p.path ? `${photoURL(p.path)}?proxy` : p.url);
 const PROXY_LONG = 3200;
+// Max magnitude an ANIMATED refit (double-click zoom-to-fit, aspect switch,
+// rotate90) is allowed to jump before it skips the CSS transition and just
+// snaps instead — see refit's own comment.
+const FLIP_MAX_JUMP = 8;
+// Stable empty-array identity for Before/After's "no stamp" state — reused
+// every render (not a fresh []) so holding compare doesn't itself trigger
+// GLImage's own [stamp, …] redraw effect on every single render tick.
+const EMPTY_STAMP = [];
 
 /* Photos at or under this file size skip the proxy + deep-zoom-tile system
    entirely in the editor: the whole original loads straight away and the
@@ -244,9 +254,23 @@ input, select { font-family: inherit; }
 .btn.primary:hover { background: #f8cf6e; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
 .btn.ghost:hover { color: var(--text); background: var(--raised); }
-.btn.danger { color: var(--danger); }
 .btn.active { border-color: var(--accent); color: var(--accent); }
+.btn.icon { width: 34px; height: 34px; padding: 0; justify-content: center; flex-shrink: 0; }
 .btn svg { flex-shrink: 0; }
+
+.tip-bubble {
+  position: fixed;
+  z-index: 1000; pointer-events: none;
+  background: var(--raised); color: var(--text); border: 1px solid var(--stroke);
+  border-radius: 6px; padding: 5px 9px; font-size: 12px; font-family: var(--sans);
+  white-space: nowrap; max-width: 280px; text-overflow: ellipsis; overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  animation: tipin .1s ease;
+}
+@keyframes tipin {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
 .thumbslider { display: flex; align-items: center; gap: 8px; color: var(--faint); }
 
@@ -513,7 +537,6 @@ input[type="range"].adj::-moz-range-thumb {
   box-shadow: 0 12px 48px rgba(0,0,0,.35);
 }
 
-.anim .imgspace { transition: transform .32s cubic-bezier(.3,.9,.3,1); will-change: transform; }
 .world { position: absolute; inset: 0; transform-origin: 0 0; }
 
 .stamp-overlay { position: absolute; inset: 0; cursor: none; touch-action: none; }
@@ -572,19 +595,6 @@ input[type="range"].adj::-moz-range-thumb {
 .chip:disabled { opacity: .35; cursor: default; pointer-events: none; }
 
 .rot-row { display: flex; align-items: center; gap: 14px; max-width: 620px; margin: 0 auto; width: 100%; }
-.level-opts {
-  display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap;
-  animation: toastin .2s ease;
-}
-.level-opts .lo-label {
-  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
-  color: var(--faint); margin-right: 4px;
-}
-.level-opts .lo-close {
-  background: none; border: none; color: var(--faint); padding: 4px; line-height: 0;
-  border-radius: 4px;
-}
-.level-opts .lo-close:hover { color: var(--text); background: var(--raised); }
 .rot-slider { flex: 1; position: relative; height: 26px; display: flex; align-items: center; }
 .rot-slider .notch { position: absolute; left: 50%; top: 0; width: 1px; height: 7px; background: var(--faint); }
 input[type="range"].rot {
@@ -708,7 +718,7 @@ input[type="range"].rot::-moz-range-thumb {
 ::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 5px; border: 2px solid var(--bg); }
 ::-webkit-scrollbar-track { background: transparent; }
 @media (prefers-reduced-motion: reduce) {
-  .anim .stage-img, .anim .cropframe, .toast { transition: none !important; animation: none !important; }
+  .toast { transition: none !important; animation: none !important; }
 }
 `;
 
@@ -884,184 +894,6 @@ async function bakeCanvas(photo, edits, scalePct = 100, maxDim = Infinity) {
   return canvas;
 }
 
-/* ------------------------------------------------------------------
-   Horizon detection v2 — Hough transform over edge points.
-   Instead of asking "which tilt do most edge pixels have" (texture
-   easily pollutes that), we ask "where is the strongest single
-   straight line", which is what a horizon actually is. Each edge
-   pixel votes only for angles close to its own gradient orientation,
-   and votes are binned by (angle, distance-from-origin). The best
-   (angle, rho) cell = the longest/strongest near-horizontal line.
-   The angle is then refined to sub-bin precision with a parabola fit.
-   ------------------------------------------------------------------ */
-const HOUGH_STEP = 0.25;                       // degrees per angle bin
-const HOUGH_N = Math.round(90 / HOUGH_STEP) + 1; // -45..+45  → 361 bins
-const RHO_STEP = 2;                            // px per rho bin
-
-async function detectHorizonCandidates(url) {
-  const img = await loadImage(url);
-  const maxDim = 640;
-  const s = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
-  const w = Math.max(3, Math.round(img.naturalWidth * s));
-  const h = Math.max(3, Math.round(img.naturalHeight * s));
-  const c = document.createElement("canvas");
-  c.width = w; c.height = h;
-  const ctx = c.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, w, h);
-  const data = ctx.getImageData(0, 0, w, h).data;
-  const g = new Float32Array(w * h);
-  for (let i = 0, j = 0; i < g.length; i++, j += 4)
-    g[i] = data[j] * 0.299 + data[j + 1] * 0.587 + data[j + 2] * 0.114;
-
-  /* --- collect near-horizontal edge points --- */
-  const px = [], py = [], pm = [], po = [];
-  let magSum = 0, magCount = 0;
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const gx =
-        -g[i - w - 1] + g[i - w + 1] - 2 * g[i - 1] + 2 * g[i + 1] - g[i + w - 1] + g[i + w + 1];
-      const gy =
-        -g[i - w - 1] - 2 * g[i - w] - g[i - w + 1] + g[i + w - 1] + 2 * g[i + w] + g[i + w + 1];
-      const mag = Math.hypot(gx, gy);
-      if (mag < 50) continue;
-      let o = (Math.atan2(gy, gx) * 180) / Math.PI + 90; // line orientation
-      o = ((o % 180) + 180) % 180;
-      if (o > 90) o -= 180;
-      if (Math.abs(o) > 50) continue; // clearly vertical structure — skip
-      px.push(x); py.push(y); pm.push(mag); po.push(o);
-      magSum += mag; magCount++;
-    }
-  }
-  if (magCount < 40) return [];
-
-  // keep the strongest points if there are too many (speed)
-  let thr = 0;
-  if (magCount > 30000) {
-    const sorted = [...pm].sort((a, b) => b - a);
-    thr = sorted[30000];
-  }
-  // cap per-pixel contrast: a soft but LONG sea horizon must be able to
-  // out-vote a short high-contrast edge (rocks, clothing, shadows)
-  const magSortedAsc = [...pm].sort((a, b) => a - b);
-  const magCap = (magSortedAsc[Math.floor(magSortedAsc.length / 2)] || 1) * 4;
-
-  /* --- Hough accumulator: angle × rho --- */
-  const diag = Math.hypot(w, h);
-  const rhoN = Math.ceil((2 * diag) / RHO_STEP) + 2;
-  const acc = new Float32Array(HOUGH_N * rhoN);
-  const sinT = new Float32Array(HOUGH_N), cosT = new Float32Array(HOUGH_N);
-  for (let a = 0; a < HOUGH_N; a++) {
-    const t = rad(a * HOUGH_STEP - 45);
-    sinT[a] = Math.sin(t); cosT[a] = Math.cos(t);
-  }
-  const SPREAD = Math.round(6 / HOUGH_STEP); // vote ±6° around own orientation
-  for (let i = 0; i < px.length; i++) {
-    if (pm[i] < thr) continue;
-    const ownBin = Math.round((clamp(po[i], -45, 45) + 45) / HOUGH_STEP);
-    const a0 = Math.max(0, ownBin - SPREAD);
-    const a1 = Math.min(HOUGH_N - 1, ownBin + SPREAD);
-    for (let a = a0; a <= a1; a++) {
-      // line at angle θ: rho = -x·sinθ + y·cosθ  (distance along the normal)
-      const rho = -px[i] * sinT[a] + py[i] * cosT[a];
-      const r = Math.round((rho + diag) / RHO_STEP);
-      acc[a * rhoN + r] += Math.min(pm[i], magCap);
-    }
-  }
-
-  /* --- per-angle: strongest single line (3-bin rho window) + where it sits --- */
-  const lineScore = new Float64Array(HOUGH_N);
-  const lineRho = new Int32Array(HOUGH_N);
-  for (let a = 0; a < HOUGH_N; a++) {
-    const base = a * rhoN;
-    let best = 0, bestR = 0;
-    for (let r = 1; r < rhoN - 1; r++) {
-      const v = acc[base + r - 1] + acc[base + r] + acc[base + r + 1];
-      if (v > best) { best = v; bestR = r; }
-    }
-    lineScore[a] = best;
-    lineRho[a] = bestR;
-  }
-  const angleOf = (a) => a * HOUGH_STEP - 45;
-
-  /* --- confidence: dominant peak must beat ambient texture --- */
-  const sortedScores = [...lineScore].sort((x, y) => x - y);
-  const median = sortedScores[Math.floor(HOUGH_N / 2)];
-  let rawTop = 0;
-  for (let a = 0; a < HOUGH_N; a++) if (lineScore[a] > lineScore[rawTop]) rawTop = a;
-  const meanMag = magSum / magCount;
-  if (lineScore[rawTop] < Math.max(median * 1.8, 0.1 * w * meanMag)) return [];
-
-  /* --- peak picking (local maxima, non-max suppression >= 2 degrees apart) --- */
-  const locals = [];
-  for (let a = 1; a < HOUGH_N - 1; a++) {
-    if (lineScore[a] >= lineScore[a - 1] && lineScore[a] > lineScore[a + 1]) locals.push(a);
-  }
-  locals.sort((x, y) => lineScore[y] - lineScore[x]);
-  const peaks = [];
-  for (const a of locals) {
-    if (peaks.every((p) => Math.abs(p - a) >= 8)) peaks.push(a);
-    if (peaks.length >= 5) break;
-  }
-  // the best near-zero line always competes (levelness guard)
-  let zeroA = -1;
-  for (let a = 0; a < HOUGH_N; a++) {
-    if (Math.abs(angleOf(a)) <= 0.3 && (zeroA < 0 || lineScore[a] > lineScore[zeroA])) zeroA = a;
-  }
-  if (zeroA >= 0 && peaks.every((p) => Math.abs(p - zeroA) >= 2)) peaks.push(zeroA);
-
-  /* --- re-rank peaks by how much of the frame the line actually spans.
-     A real horizon is LONG (it even continues behind people), while a
-     high-contrast rock or clothing edge is short. Contrast is capped
-     during voting, so here length - not punchiness - decides. --- */
-  const evalPeak = (a) => {
-    const t = rad(angleOf(a));
-    const sn = Math.sin(t), cs = Math.cos(t);
-    const rho0 = lineRho[a] * RHO_STEP - diag;
-    let minX = Infinity, maxX = -Infinity;
-    for (let i = 0; i < px.length; i++) {
-      if (pm[i] < thr) continue;
-      if (Math.abs(po[i] - angleOf(a)) > 8) continue;
-      const rho = -px[i] * sn + py[i] * cs;
-      if (Math.abs(rho - rho0) > RHO_STEP * 2.5) continue;
-      if (px[i] < minX) minX = px[i];
-      if (px[i] > maxX) maxX = px[i];
-    }
-    const extent = maxX > minX ? (maxX - minX) / w : 0;
-    // refine to sub-bin precision
-    let refined = a;
-    if (a > 0 && a < HOUGH_N - 1) {
-      const s0 = lineScore[a - 1], s1 = lineScore[a], s2 = lineScore[a + 1];
-      const denom = s0 - 2 * s1 + s2;
-      if (Math.abs(denom) > 1e-6) refined = a + clamp(0.5 * ((s0 - s2) / denom), -1, 1);
-    }
-    let angle = clamp(-(refined * HOUGH_STEP - 45), -45, 45);
-    if (Math.abs(angle) < 0.35) angle = 0;
-    const final = lineScore[a] * (0.3 + 0.7 * extent) * Math.exp(-Math.abs(angleOf(a)) / 30);
-    return { angle, extent, final, raw: lineScore[a] };
-  };
-
-  /* --- present the finalists as named techniques, best one first --- */
-  const evals = peaks.map(evalPeak);
-  if (!evals.length) return [];
-  if ([...evals].sort((x, y) => y.final - x.final)[0].extent < 0.18) return [];
-  const pickMax = (arr, f) => arr.reduce((m, c) => (f(c) > f(m) ? c : m));
-  const cands = [];
-  const addC = (c, tag) => {
-    if (c && !cands.some((o) => Math.abs(o.angle - c.angle) < 0.3)) cands.push({ ...c, tag });
-  };
-  addC(pickMax(evals, (e) => e.extent), "Longest line");
-  addC(pickMax(evals, (e) => e.raw), "Strongest line");
-  addC(evals.reduce((m, c) => (Math.abs(c.angle) < Math.abs(m.angle) ? c : m)), "Smallest tilt");
-  cands.sort((x, y) => y.final - x.final);
-  // level-guard: near-zero line rivaling the winner -> the photo is straight
-  const zero = cands.find((o) => o.angle === 0);
-  if (zero && cands[0].angle !== 0 && zero.final >= 0.75 * cands[0].final) {
-    cands.sort((x, y) => (x.angle === 0 ? -1 : y.angle === 0 ? 1 : 0));
-  }
-  return cands.slice(0, 3).map(({ angle, tag }) => ({ angle, tag }));
-}
-
 /* ============ browser-mode file import (fallback) ============ */
 // in the desktop app TIFF/RAW/HEIC are converted by the main process;
 // in a plain browser undecodable files are skipped on load automatically
@@ -1103,7 +935,6 @@ const I = {
   photos: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6"/><path d="M21 15l-5-5-9 9"/></svg>,
   folder: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>,
   upload: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/></svg>,
-  trash: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m3 0l-1 13H7L6 7"/></svg>,
   export: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 4v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/></svg>,
   back: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M15 5l-7 7 7 7"/></svg>,
   level: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="9"/><path d="M3.5 14.5l17-5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>,
@@ -1114,7 +945,78 @@ const I = {
   sort: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M7 4v14m0 0l-3-3m3 3l3-3M17 20V6m0 0l-3 3m3-3l3 3"/></svg>,
   sun: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>,
   moon: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>,
+  compare: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>,
+  reset: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3.5 9a9 9 0 1 1-1 6.5"/><path d="M3.5 3.5v5.5h5.5"/></svg>,
+  done: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round"><path d="M5 13l4 4 10-10"/></svg>,
+  select: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M8 12.5l2.5 2.5L16 9.5"/></svg>,
+  close: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>,
 };
+
+/* Custom hover tooltip: the browser's native `title` attribute has an
+   inconsistent, engine-controlled delay (worse inside Electron) — this
+   gives every hint the same reliable 1s-hold-to-show behavior instead.
+   Clones the single child to attach a measuring ref + mouse handlers, so
+   it adds no wrapper element/box to the layout; the bubble itself renders
+   through a portal so it always sits above everything, positioned from
+   the trigger's live bounding box rather than any local stacking context. */
+function Tip({ text, children }) {
+  const [pos, setPos] = useState(null);   // trigger anchor {x, y} once shown
+  const [box, setBox] = useState(null);   // measured, viewport-clamped {left, top}
+  const nodeRef = useRef(null);
+  const bubbleRef = useRef(null);
+  const timerRef = useRef(null);
+
+  const cancel = () => { clearTimeout(timerRef.current); timerRef.current = null; };
+  const onEnter = () => {
+    cancel();
+    timerRef.current = setTimeout(() => {
+      const r = nodeRef.current?.getBoundingClientRect();
+      if (!r) return;
+      setBox(null);
+      setPos({ x: r.left + r.width / 2, y: r.bottom + 8 });
+    }, 1000);
+  };
+  const onLeave = () => { cancel(); setPos(null); setBox(null); };
+  useEffect(() => cancel, []);
+
+  // runs before paint, so the un-clamped first-pass position (below) is
+  // never actually visible — this only matters once the bubble's real
+  // rendered width is known, which is exactly what was missing before:
+  // a fixed 54px guess clipped any tooltip wider than ~110px at the edge.
+  useLayoutEffect(() => {
+    if (!pos || !bubbleRef.current) return;
+    const r = bubbleRef.current.getBoundingClientRect();
+    const margin = 8;
+    const left = Math.max(margin, Math.min(pos.x - r.width / 2, window.innerWidth - margin - r.width));
+    setBox({ left, top: pos.y });
+  }, [pos]);
+
+  if (!text) return children;
+  const child = Children.only(children);
+  const merged = cloneElement(child, {
+    ref: (node) => {
+      nodeRef.current = node;
+      const r = child.ref;
+      if (typeof r === "function") r(node);
+      else if (r && typeof r === "object") r.current = node;
+    },
+    onMouseEnter: (e) => { child.props.onMouseEnter?.(e); onEnter(); },
+    onMouseLeave: (e) => { child.props.onMouseLeave?.(e); onLeave(); },
+    onPointerDown: (e) => { child.props.onPointerDown?.(e); onLeave(); },
+  });
+
+  return (
+    <>
+      {merged}
+      {pos && createPortal(
+        <div ref={bubbleRef} className="tip-bubble" style={{ left: box ? box.left : pos.x, top: pos.y }}>
+          {text}
+        </div>,
+        document.body
+      )}
+    </>
+  );
+}
 
 /* ============================================================
    RATING STARS / METADATA PANEL / FILMSTRIP
@@ -1123,14 +1025,14 @@ function Stars({ value = 0, onChange, readonly }) {
   return (
     <div className={`stars ${readonly ? "readonly" : ""}`}>
       {[1, 2, 3, 4, 5].map((n) => (
-        <button
-          key={n}
-          className={n <= value ? "lit" : ""}
-          onClick={() => onChange && onChange(n === value ? 0 : n)}
-          title={`${n}`}
-        >
-          ★
-        </button>
+        <Tip key={n} text={`${n}`}>
+          <button
+            className={n <= value ? "lit" : ""}
+            onClick={() => onChange && onChange(n === value ? 0 : n)}
+          >
+            ★
+          </button>
+        </Tip>
       ))}
     </div>
   );
@@ -1447,22 +1349,22 @@ function Filmstrip({ items, currentId, onSelect, selectedIds, onToggleSel, onRan
       {items.map((p, idx) => {
         const isSel = selectedIds?.has(p.id);
         return (
-          <div
-            key={p.id}
-            className={`strip-item ${p.id === currentId ? "current" : ""} ${isSel ? "sel" : ""}`}
-            onClick={(e) => click(p, idx, e)}
-            onContextMenu={(e) => { e.preventDefault(); onContext && onContext(p.id, e.clientX, e.clientY); }}
-            onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
-            title={`${p.name} — Ctrl+click to select, Shift+click for a range, right-click to export`}
-          >
-            <Thumb src={p.previewUrl || thumbURL(p)} />
-            {p.edits && <div className="sedit" />}
-            {isSel && <div className="scheck">{I.check}</div>}
-            <div className="sinfo">
-              <span>{fmtSize(p.sizeBytes)}</span>
-              {p.rating > 0 && <span className="sstars">{"★".repeat(p.rating)}</span>}
+          <Tip key={p.id} text={`${p.name} — Ctrl+click to select, Shift+click for a range, right-click to export`}>
+            <div
+              className={`strip-item ${p.id === currentId ? "current" : ""} ${isSel ? "sel" : ""}`}
+              onClick={(e) => click(p, idx, e)}
+              onContextMenu={(e) => { e.preventDefault(); onContext && onContext(p.id, e.clientX, e.clientY); }}
+              onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
+            >
+              <Thumb src={p.previewUrl || thumbURL(p)} />
+              {p.edits && <div className="sedit" />}
+              {isSel && <div className="scheck">{I.check}</div>}
+              <div className="sinfo">
+                <span>{fmtSize(p.sizeBytes)}</span>
+                {p.rating > 0 && <span className="sstars">{"★".repeat(p.rating)}</span>}
+              </div>
             </div>
-          </div>
+          </Tip>
         );
       })}
     </div>
@@ -1513,7 +1415,14 @@ void main() {
 const MAX_STAMP_DABS = 300;
 
 const GL_FRAG = `
-precision mediump float;
+// highp, not mediump: this shader round-trips through pow() twice
+// (sRGB<->linear, see below) — on genuine mediump precision (~10-bit
+// mantissa) that round-trip alone can band visibly, especially in
+// shadow detail where the sRGB curve is steepest. Desktop GPUs (this is
+// an Electron app, not a mobile WebView) reliably implement highp in
+// fragment shaders even though the GLSL ES spec only guarantees it in
+// vertex shaders.
+precision highp float;
 uniform sampler2D u_tex;
 uniform float u_wbGainR, u_wbGainG, u_wbGainB;
 uniform float u_satGain;
@@ -1530,16 +1439,34 @@ float smoothstepClamp(float e0, float e1, float x) {
   return t * t * (3.0 - 2.0 * t);
 }
 
+/* Standard sRGB (IEC 61966-2-1) transfer function — see
+   electron/colorAdjust.mjs's header for why white balance/exposure/
+   saturation happen in LINEAR light rather than directly on the
+   gamma-encoded texture values, and why contrast/highlights/shadows/
+   levels deliberately don't move too. KEEP IN SYNC WITH colorAdjust.mjs
+   (srgbToLinear/linearToSrgb/adjustPixel). */
+vec3 srgbToLinear(vec3 c) {
+  vec3 lo = c / 12.92;
+  vec3 hi = pow(max((c + 0.055) / 1.055, 0.0), vec3(2.4));
+  return mix(lo, hi, step(0.04045, c));
+}
+vec3 linearToSrgb(vec3 c) {
+  vec3 lo = c * 12.92;
+  vec3 hi = 1.055 * pow(max(c, 0.0), vec3(1.0 / 2.4)) - 0.055;
+  return mix(lo, hi, step(0.0031308, c));
+}
+
 void main() {
-  vec3 c = texture2D(u_tex, v_uv).rgb;
+  vec3 tex = texture2D(u_tex, v_uv).rgb;
 
-  /* KEEP IN SYNC WITH electron/colorAdjust.mjs adjustPixel() */
-  c *= vec3(u_wbGainR, u_wbGainG, u_wbGainB);
+  vec3 lin = srgbToLinear(tex);
+  lin *= vec3(u_wbGainR, u_wbGainG, u_wbGainB);
+  lin *= u_exposureGain;
+  float grayLin = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+  lin = grayLin + (lin - grayLin) * u_satGain;
 
-  float gray0 = dot(c, vec3(0.2126, 0.7152, 0.0722));
-  c = gray0 + (c - gray0) * u_satGain;
+  vec3 c = linearToSrgb(max(lin, 0.0));
 
-  c *= u_exposureGain;
   c = (c - 0.5) * (1.0 + u_contrastAmt) + 0.5;
 
   float lumH = dot(c, vec3(0.2126, 0.7152, 0.0722));
@@ -1549,8 +1476,8 @@ void main() {
   float sd = (1.0 - smoothstepClamp(0.0, 0.5, lumS)) * u_shadowGain;
   c += sd >= 0.0 ? sd * (1.0 - c) : sd * c;
 
-  float lo = u_blackShift, hi = 1.0 - u_whiteShift;
-  c = (c - lo) / max(0.05, hi - lo);
+  float lo2 = u_blackShift, hi2 = 1.0 - u_whiteShift;
+  c = (c - lo2) / max(0.05, hi2 - lo2);
 
   gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
@@ -2077,7 +2004,20 @@ function resampleForOutline(points, radius) {
    same as Photoshop's Clone Stamp / Lightroom's Heal brush).
    screenToImage/imageToLocal reuse the exact same rot/irot + view.k/theta
    conversion the crop tool's own drag math and deep-zoom tile fetch use. */
-function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef }) {
+/* Closest distance from (px,py) to the segment a->b — same projection-and-
+   clamp technique as electron/stampTool.mjs's own closestOnSegment, used
+   here for StampOverlay's stroke hit-testing (see nearestPointDist) so
+   "can I grab this part of the stroke" matches "is this part of the
+   stroke actually painted" exactly, rather than a coarser approximation. */
+function distToSegment(px, py, ax, ay, bx, by) {
+  const abx = bx - ax, aby = by - ay;
+  const lenSq = abx * abx + aby * aby;
+  let t = lenSq > 0 ? ((px - ax) * abx + (py - ay) * aby) / lenSq : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(px - (ax + abx * t), py - (ay + aby * t));
+}
+
+function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef, spaceRef }) {
   const screenToImage = useCallback((clientX, clientY) => {
     const box = stageRef.current.getBoundingClientRect();
     const sx = clientX - box.left, sy = clientY - box.top;
@@ -2094,23 +2034,19 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
 
   /* Space bar = temporary hand tool, same convention as Photoshop/Lightroom:
      hold it to pan (and double-click to zoom-to-fit) without switching out
-     of the stamp brush. Tracked as a ref (not state) since it changes on
-     every keydown/keyup and doesn't need to trigger a re-render — only the
-     imperative cursor style and the pointer handlers below read it. Scoped
-     to this component's own mount/unmount (only relevant while the stamp
-     overlay is actually showing), so it never needs wiring through Editor. */
-  const spaceRef = useRef(false);
+     of the stamp brush. The canonical down/up state (`spaceRef`, a prop —
+     see Editor) is now tracked in Editor, not here, since crop mode needs
+     to read it too and has no StampOverlay mounted at all; this effect only
+     handles the cursor-style side effects that ARE local to this overlay. */
   const overlayRef = useRef(null);
   useEffect(() => {
     const down = (ev) => {
       if (ev.code !== "Space" || ev.repeat) return;
-      spaceRef.current = true;
       if (overlayRef.current) overlayRef.current.style.cursor = "grab";
       hideCursor();
     };
     const up = (ev) => {
       if (ev.code !== "Space") return;
-      spaceRef.current = false;
       if (overlayRef.current) overlayRef.current.style.cursor = "none";
     };
     window.addEventListener("keydown", down);
@@ -2161,8 +2097,27 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
   // source ring/handles until the stroke commits (those still only make
   // sense for a finished, selectable stroke).
   const totalDabs = stamp.reduce((n, s) => n + s.points.length, 0);
-  const nearestPointDist = (stroke, x, y) =>
-    stroke.points.reduce((min, p) => Math.min(min, Math.hypot(p.x - x, p.y - y)), Infinity);
+  // Distance to the stroke's own CAPSULE (nearest point on any segment of
+  // its polyline, matching applyStrokeToBuffer's own closest-segment
+  // footprint test in electron/stampTool.mjs) — not just distance to its
+  // stored points. A stroke's visible/painted coverage is the whole swept
+  // capsule, including the area BETWEEN two points, not a chain of small
+  // circles centered exactly on each stored point; checking only stored
+  // points meant part of what's visibly stamped (anywhere more than one
+  // point's own radius from the nearest single point, but still within the
+  // capsule between two points) couldn't be clicked to grab/move the
+  // stroke, even though the exact same spot could have been clicked to
+  // start painting a stamp there in the first place.
+  const nearestPointDist = (stroke, x, y) => {
+    const pts = stroke.points;
+    if (pts.length < 2) return Math.hypot(pts[0].x - x, pts[0].y - y);
+    let min = Infinity;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const d = distToSegment(x, y, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y);
+      if (d < min) min = d;
+    }
+    return min;
+  };
 
   const updateStroke = (index, patch) => {
     setStamp((prev) => prev.map((s, i) => (i === index ? { ...s, ...patch } : s)));
@@ -2393,35 +2348,46 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
      own outline is a more complex shape that a self-intersecting centerline
      can render inconsistently). A disk union has no such failure mode, and
      it automatically gives just the one true OUTER boundary even when the
-     path loops back on itself — no inner-loop seams to filter out. */
+     path loops back on itself — no inner-loop seams to filter out.
+
+     The band is a thin two-tone contour — a slightly wider dark casing
+     directly behind a thinner bright line, both centered tightly on the
+     TRUE silhouette radius (rPx) — not two independently-sized bands. An
+     earlier version scaled the dark casing's OUTER edge outward by up to
+     8% of rPx with no matching cap, so on a large/zoomed-in stroke the
+     "outline" visibly bulged past the stroke's real edge and ate a good
+     chunk of its interior — reported directly ("аутлайн гигантский на
+     контуре"). Both bands now derive from the same small `ringW`, so the
+     whole contour stays a few px thin and hugs the real boundary
+     regardless of stroke size or zoom. */
   const strokeRing = (idPrefix, stroke, dx, dy, rPx, ringW, color) => {
     const centers = resampleForOutline(stroke.points, stroke.radius).map((p) => imageToLocal(p.x + dx, p.y + dy));
     // the hole punched out of the middle must NEVER reach (let alone clamp
     // to) 0 — that would leave the outer circle fully unmasked, rendering
-    // as a SOLID filled disc instead of a ring (this is exactly what made
-    // the outline turn into a growing black blob while zooming out: rPx
-    // shrinks, a fixed-px ring width doesn't shrink with it, and once it
-    // caught up to rPx the hole vanished). Keeping both holes a proportion
-    // of rPx instead of a fixed px amount guarantees a hole always exists.
-    const inner = Math.max(rPx * 0.35, rPx - ringW);
-    const haloOuter = rPx + Math.max(0.5, rPx * 0.08);
-    const haloInner = Math.max(rPx * 0.15, rPx - ringW - 2);
+    // as a SOLID filled disc instead of a ring. `Math.max(0.1, …)` below
+    // guarantees a hole always exists even for a tiny rPx.
+    const lineHalf = ringW * 0.5;
+    const casingHalf = lineHalf + 1;
+    const casingOuter = rPx + casingHalf;
+    const casingInner = Math.max(0.1, rPx - casingHalf);
+    const lineOuter = rPx + lineHalf;
+    const lineInner = Math.max(0.1, rPx - lineHalf);
     const haloId = `${idPrefix}-halo`, ringId = `${idPrefix}-ring`;
     return (
       <g>
         <mask id={haloId}>
-          {centers.map((c, k) => <circle key={`ho${k}`} cx={c.left} cy={c.top} r={haloOuter} fill="#fff" />)}
-          {haloInner > 0 && centers.map((c, k) => <circle key={`hi${k}`} cx={c.left} cy={c.top} r={haloInner} fill="#000" />)}
+          {centers.map((c, k) => <circle key={`ho${k}`} cx={c.left} cy={c.top} r={casingOuter} fill="#fff" />)}
+          {centers.map((c, k) => <circle key={`hi${k}`} cx={c.left} cy={c.top} r={casingInner} fill="#000" />)}
         </mask>
         <g mask={`url(#${haloId})`}>
-          {centers.map((c, k) => <circle key={`hc${k}`} cx={c.left} cy={c.top} r={haloOuter} fill="rgba(0,0,0,.6)" />)}
+          {centers.map((c, k) => <circle key={`hc${k}`} cx={c.left} cy={c.top} r={casingOuter} fill="rgba(0,0,0,.6)" />)}
         </g>
         <mask id={ringId}>
-          {centers.map((c, k) => <circle key={`ro${k}`} cx={c.left} cy={c.top} r={rPx} fill="#fff" />)}
-          {inner > 0 && centers.map((c, k) => <circle key={`ri${k}`} cx={c.left} cy={c.top} r={inner} fill="#000" />)}
+          {centers.map((c, k) => <circle key={`ro${k}`} cx={c.left} cy={c.top} r={lineOuter} fill="#fff" />)}
+          {centers.map((c, k) => <circle key={`ri${k}`} cx={c.left} cy={c.top} r={lineInner} fill="#000" />)}
         </mask>
         <g mask={`url(#${ringId})`}>
-          {centers.map((c, k) => <circle key={`rc${k}`} cx={c.left} cy={c.top} r={rPx} fill={color} />)}
+          {centers.map((c, k) => <circle key={`rc${k}`} cx={c.left} cy={c.top} r={lineOuter} fill={color} />)}
         </g>
       </g>
     );
@@ -2455,7 +2421,7 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
           // ring/halo thickness scale down for a small brush radius, capped
           // for a large one — a fixed pixel width made a thin brush (e.g.
           // tracing a pole/wire) look almost solid rather than hollow.
-          const ringW = Math.max(1.5, Math.min(3, rPx * 0.15));
+          const ringW = Math.max(1.25, Math.min(2.25, rPx * 0.05));
           // a plain white outline all but vanishes against a bright sky —
           // a light cyan reads clearly against both light and dark content
           const dstColor = isSel ? "#f3c34f" : "rgba(130,215,255,.95)";
@@ -2479,7 +2445,7 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
         })}
         {draft && draft.points.length > 0 && (() => {
           const rPx = draft.radius * view.k;
-          const ringW = Math.max(1.5, Math.min(3, rPx * 0.15));
+          const ringW = Math.max(1.25, Math.min(2.25, rPx * 0.05));
           return <g key="stamp-draft">{strokeRing("stamp-draft", draft, 0, 0, rPx, ringW, "rgba(130,215,255,.95)")}</g>;
         })()}
       </svg>
@@ -2518,11 +2484,8 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [rect, setRect] = useState(null);
   const [view, setView] = useState(null); // { icx, icy, k, theta }
-  const [anim, setAnim] = useState(false);
   const [aspect, setAspect] = useState("free");
   const [flipped, setFlipped] = useState(false);
-  const [leveling, setLeveling] = useState(false);
-  const [levelOpts, setLevelOpts] = useState(null);
   const [mode, setMode] = useState("view"); // 'view' = clean cropped photo, 'crop' = editing UI, 'stamp' = clone stamp
   const [adjust, setAdjust] = useState(() => ({ ...defaultAdjust(), ...(photo.edits?.adjust || {}) }));
   const [stamp, setStamp] = useState(() => normalizeStamp(photo.edits?.stamp ?? photo.edits?.heal));
@@ -2534,13 +2497,19 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   // undo/redo history or `currentEdits()` — only a finished, committed
   // stroke in `stamp` itself is either of those things.
   const [draft, setDraft] = useState(null);
+  // Before/After: hold to preview the photo with adjust/stamp reverted to
+  // their untouched state, crop/rotation left exactly as-is (comparing
+  // color+retouch work, not re-flowing the whole framing). State, not a
+  // ref like spaceRef — this needs to actually trigger a re-render (GLImage
+  // redraws off an `adjust` reference change, see its own [adjust,
+  // scheduleDraw] effect), not just change how a pointer handler routes.
+  const [compareBefore, setCompareBefore] = useState(false);
   const [gesturing, setGesturing] = useState(false); // GPU-compositing hint during zoom/pan
   const [tile, setTile] = useState(null);            // deep-zoom sharpness overlay
   const [exif, setExif] = useState(null);
   const tileTimer = useRef(null);
   const tileUrl = useRef(null);
   const tileToken = useRef(0);
-  const hist = useRef({ undo: [], redo: [] });
   const worldRef = useRef(null);
   const flipSeq = useRef(0);
   const flipBusyUntil = useRef(0);
@@ -2595,6 +2564,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   }, []);
 
   /* --- crop history (Ctrl+Z / Ctrl+Shift+Z) --- */
+  const hist = useRef({ undo: [], redo: [] });
   const snapshot = useCallback(() => {
     if (!rect || !view) return;
     hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
@@ -2632,6 +2602,64 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const refitTimer = useRef(null);
   const iw = photo.w, ih = photo.h;
 
+  /* Space bar = temporary hand tool (Photoshop/Lightroom convention), read
+     by StampOverlay's own pointer handlers AND by the crop-frame/handle
+     drag starters below (dragOrPan) so holding it pans the whole workspace
+     instead of painting/dragging-the-photo-under-a-fixed-frame/resizing —
+     needs to live here, not inside StampOverlay, since crop mode has no
+     StampOverlay mounted at all. A ref, not state: changes on every keydown/
+     keyup and doesn't need a re-render, only imperative reads. */
+  const spaceRef = useRef(false);
+  useEffect(() => {
+    const down = (ev) => {
+      if (ev.code !== "Space" || ev.repeat || suppressKeys) return;
+      const tag = ev.target?.tagName;
+      if ((tag === "INPUT" && ev.target.type !== "range") || tag === "TEXTAREA") return;
+      spaceRef.current = true;
+    };
+    const up = (ev) => {
+      if (ev.code !== "Space") return;
+      spaceRef.current = false;
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
+  }, [suppressKeys]);
+
+  /* Before/After: hold Backslash (same key Lightroom uses for this exact
+     purpose) to compare against the untouched photo — mirrors the Space
+     effect just above (down/up pair, same suppressKeys/text-field guard),
+     but sets real STATE rather than a ref, since this needs to trigger a
+     redraw, not just change how a pointer handler routes. */
+  useEffect(() => {
+    const down = (ev) => {
+      if (ev.code !== "Backslash" || ev.repeat || suppressKeys) return;
+      const tag = ev.target?.tagName;
+      if ((tag === "INPUT" && ev.target.type !== "range") || tag === "TEXTAREA") return;
+      ev.preventDefault();
+      setCompareBefore(true);
+    };
+    const up = (ev) => {
+      if (ev.code !== "Backslash") return;
+      setCompareBefore(false);
+    };
+    // an OS-level app switch (Cmd+Tab etc.) mid-hold never delivers the
+    // matching keyup — without this, releasing the key after refocusing
+    // wouldn't be seen either, leaving the compare stuck on indefinitely.
+    const onBlur = () => setCompareBefore(false);
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [suppressKeys]);
+
   // clone stamp brush settings — session-local (not persisted; each
   // already-painted stroke keeps its own radius/feather/opacity regardless
   // of later slider changes, same as real brush tools). feather is the
@@ -2654,8 +2682,16 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
      pixels that get blended). */
   const editPixelsRef = useRef(null); // { data, width, height, scale } — scale = buffer px per original-image px
   useEffect(() => {
+    editPixelsRef.current = null; // always clear on photo change — never stamp against a stale buffer
+  }, [photo.id, photo.path]);
+  // Decoding this is a full proxy-resolution canvas draw + getImageData (up
+  // to 3200x3200, ~40MB) — real CPU/memory cost that's wasted on every
+  // single photo view if the user never opens Stamp. Gated on mode==="stamp"
+  // so it only pays for itself when actually needed; low-end-hardware win
+  // since most viewing is crop/develop, not retouching.
+  useEffect(() => {
+    if (mode !== "stamp") return;
     let alive = true;
-    editPixelsRef.current = null;
     loadImage(proxyURL(photo)).then((img) => {
       if (!alive) return;
       const c = document.createElement("canvas");
@@ -2669,7 +2705,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       };
     }).catch(() => {});
     return () => { alive = false; };
-  }, [photo.id, photo.path, iw]);
+  }, [photo.id, photo.path, iw, mode]);
 
   // stable object identities (GLImage's redraw effect depends on texRegion)
   const baseTexRegion = useMemo(() => ({ sx: 0, sy: 0, sw: iw }), [iw]);
@@ -2813,9 +2849,20 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setView(nv);
     if (animate && Math.abs(f - 1) > 1e-4) {
       const jump = Math.max(f, 1 / f); // magnitude of the scale change, >=1
-      const dur = clamp(260 + Math.log2(jump) * 55, 260, 460);
-      flipBusyUntil.current = performance.now() + dur + 60;
-      setFlipReq({ tx: oc.x - nc.x / f, ty: oc.y - nc.y / f, s: 1 / f, n: ++flipSeq.current, dur });
+      // Past FLIP_MAX_JUMP, skip the animated transition entirely and just
+      // snap (state already jumped above either way) — a CSS transform
+      // animating such a large scale change in a fixed ~460ms window is
+      // what caused visible compositing glitches before (see kHigh's own
+      // comment on the wheel-zoom ceiling this call can now reach). This
+      // decouples "how close you're allowed to zoom" from "how big an
+      // animated fit-to-screen jump ever has to render" — instead of
+      // capping the former to avoid the latter, the latter just stops
+      // animating past a safe magnitude.
+      if (jump <= FLIP_MAX_JUMP) {
+        const dur = clamp(260 + Math.log2(jump) * 55, 260, 460);
+        flipBusyUntil.current = performance.now() + dur + 60;
+        setFlipReq({ tx: oc.x - nc.x / f, ty: oc.y - nc.y / f, s: 1 / f, n: ++flipSeq.current, dur });
+      }
     }
   }, [stage, fadeOutTile, cancelFlip]);
 
@@ -2923,6 +2970,22 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     window.addEventListener("pointerup", onUp, { once: true });
   };
 
+  /* Crop mode's hand tool: while Space is held, dragging .cropframe or a
+     handle pans the photo under the screen-fixed crop selection instead of
+     doing whatever that element normally does (reposition-photo-under-frame
+     is ALSO exactly what this is, or resize) — reusing "image" mode's own
+     existing math and clampCenter coverage guarantee (the photo can never
+     be dragged so far that part of the crop rect would show outside it) —
+     deliberately NOT an unclamped free-look mode (tried, reverted: let the
+     crop selection extend past the photo's own edges, not what was asked
+     for). This just gives that same clamped pan a second entry point,
+     available from Space anywhere, not only from a plain drag starting
+     exactly inside the frame. */
+  const dragOrPan = (mode) => (e) => {
+    if (spaceRef.current) { startDrag("image")(e); return; }
+    startDrag(mode)(e);
+  };
+
   /* "Original" aspect means "this photo's own aspect ratio, as currently
      oriented" — after a quarter-turn (rotate90, portrait<->landscape), that's
      ih/iw, not iw/ih. A small fine-leveling angle doesn't flip it (only a
@@ -2957,7 +3020,11 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     }
 
     if (d.mode === "pan") {
-      // hand tool: move the whole workspace (frame + image together)
+      // move the whole workspace (frame + image together) — repositions the
+      // viewport within the app window, but since rect and icx/icy shift by
+      // the identical amount, it can never reveal different photo content.
+      // Used for .stage's own background drag in view/stamp mode; crop
+      // mode's hand tool goes through "image" instead (see dragOrPan).
       setRect({ x: d.rect.x + dx, y: d.rect.y + dy, w: d.rect.w, h: d.rect.h });
       setView((v) => ({ ...v, icx: d.view.icx + dx, icy: d.view.icy + dy }));
       return;
@@ -3091,15 +3158,22 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     const k = Math.max(zoomBase.current, minK(nr, deg) * 1.0005);
     let icx = cx, icy = cy;
     [icx, icy] = clampCenter(icx, icy, nr, k, deg);
-    setRect(nr);
-    setView({ icx, icy, k, theta: deg });
     // animate=false: an animated refit here can be interrupted mid-flight by
     // cancelFlip() from another quick action (rotate/aspect/resize again
     // before this one's ~260-460ms CSS transition finishes), which freezes
     // .world's transform on a half-finished frame instead of the correct
     // final one — same hazard as the crop-area double-click bug, fixed the
     // same way (see .cropframe's onDoubleClick comment for the full story).
-    setTimeout(() => setView((vv) => { refit(nr, vv, false); return vv; }), 20);
+    //
+    // ONE synchronous call, not the old setRect+setView now / refit 20ms
+    // later via setTimeout: staggering "rotate in place" and "fit to the
+    // visible stage" across two separate render ticks meant the frame
+    // visibly double-snapped — an instant jump to the rotated-but-not-yet-
+    // fitted size, then a second instant jump to the final fitted size a
+    // frame later — which read as a stutter rather than one clean motion.
+    // refit() here still doesn't animate (same reason as always), but at
+    // least it's a single snap instead of two.
+    refit(nr, { icx, icy, k, theta: deg }, false);
   }, [rect, view, snapshot, minK, clampCenter, refit, cancelFlip]);
 
   /* --- aspect selection: expand to the largest crop the whole image
@@ -3170,17 +3244,42 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       // much stronger multiplier instead of sharing the scroll one.
       const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.0096 : 0.0024));
       const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
-      const kFitImg = Math.min(availW / iw, availH / ih); // whole image visible
-      const kLow = Math.min(view.k, kFitImg);
-      // capped well short of the old 20x: past this, a fit-to-screen
-      // double-click has to animate such a large jump that the FLIP
-      // transform's compositing glitches become visible.
-      const kHigh = Math.max(view.k, kFitImg * 6);
+      // Same "fit" target refit()/double-click computes (Math.min(availW/
+      // rect.w, availH/rect.h) applied to the CURRENT k) — NOT a separately
+      // -derived "fit the raw iw/ih" number, which silently diverged from
+      // the real fit target whenever a crop or a 90/270 rotation was active
+      // (rect's own w/h already account for both; recomputing straight from
+      // iw/ih did not), leaving wheel-zoom-out unable to reach the same
+      // fully-zoomed-out state a double-click reaches.
+      const kFit = view.k * Math.min(availW / rect.w, availH / rect.h);
+      const kLow = Math.min(view.k, kFit);
+      // Raised from an original 6x to 20x on request, now that full-
+      // resolution originals (up to ~30MB) are the norm rather than a
+      // downsampled proxy — there's real detail to zoom into past the old
+      // ceiling. This used to be capped much lower specifically because an
+      // ANIMATED fit-to-screen double-click from way out here had to jump
+      // such a large scale factor that the FLIP transition's compositing
+      // visibly glitched — that's now handled independently by FLIP_MAX_JUMP
+      // (refit skips the animation and snaps instead, past a safe jump
+      // magnitude), so this ceiling no longer needs to stay low to avoid it.
+      // Wheel-zoom itself (this handler) was never animated either way.
+      const kHigh = Math.max(view.k, kFit * 20);
       const k2 = clamp(view.k * factor, kLow, kHigh);
       const f = k2 / view.k;
       if (Math.abs(f - 1) < 1e-6) return;
       cancelFlip();
       gestureOn();
+      // Hitting the zoom-out floor this tick: snap straight to refit()'s own
+      // centered result (exactly what a double-click produces) instead of
+      // the cursor-anchored math below. That math only matches the fit
+      // SCALE at the floor, not necessarily the same on-screen POSITION —
+      // if the cursor wasn't dead-center when the floor was reached, the
+      // frame would land at the right zoom but off-center, which doesn't
+      // read as "the same fully-zoomed-out state" a double-click gives.
+      if (view.k > kFit && k2 <= kFit + 1e-9) {
+        refit(rect, view, false);
+        return;
+      }
       const nr = {
         x: m.x + (rect.x - m.x) * f,
         y: m.y + (rect.y - m.y) * f,
@@ -3198,7 +3297,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [rect, view, stage, iw, ih, gestureOn, cancelFlip]);
+  }, [rect, view, stage, iw, ih, gestureOn, cancelFlip, refit]);
 
   /* --- deep-zoom sharpness: when the gesture settles and the view is
      zoomed past the proxy's resolution, fetch a tile of the visible
@@ -3256,40 +3355,10 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (tileUrl.current) URL.revokeObjectURL(tileUrl.current);
   }, []);
 
-  const applyLevelOption = useCallback((angle) => {
-    snapshot();
-    setAnim(true);
-    applyRotation(Math.round(angle * 10) / 10);
-    setTimeout(() => setAnim(false), 360);
-  }, [applyRotation, snapshot]);
-
-  const autoLevel = async () => {
-    setLeveling(true);
-    try {
-      const cands = await detectHorizonCandidates(photo.url);
-      if (!cands.length) {
-        toast("No clear horizon detected — adjust manually");
-        setLevelOpts(null);
-        return;
-      }
-      const best = cands[0];
-      applyLevelOption(best.angle);
-      // offer the alternatives (plus a way back to 0°) so the user decides
-      const opts = [...cands];
-      if (!opts.some((o) => o.angle === 0)) opts.push({ angle: 0, tag: "Original" });
-      setLevelOpts(opts);
-      toast(best.angle === 0
-        ? "Horizon already looks level"
-        : `Leveled by ${best.angle > 0 ? "+" : ""}${best.angle.toFixed(1)}° — tap an alternative if it's off`);
-    } finally {
-      setLeveling(false);
-    }
-  };
-
   const reset = () => {
     snapshot();
     cancelFlip();
-    setAspect("free"); setFlipped(false); setLevelOpts(null);
+    setAspect("free"); setFlipped(false);
     setAdjust(defaultAdjust());
     setStamp([]);
     setSelectedStroke(null);
@@ -3380,7 +3449,6 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const apply = async () => {
     const [e, preview] = await buildEdits();
     onApply(e, preview);
-    setLevelOpts(null);
     // Only re-fit after committing a CROP: the frame itself just changed, so
     // normalizing the view to the new crop is expected. Applying from stamp
     // mode (or from view mode, e.g. just color-adjusting) must leave zoom/pan
@@ -3445,7 +3513,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       // left alone here, since those are the native way to nudge a focused
       // range input and must not be hijacked for sibling-photo navigation.
       if (tag === "INPUT" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) return;
-      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+      // `ev.code` (the physical key, e.g. "BracketLeft") is used for every
+      // shortcut below that's normally a printable character — `ev.key`
+      // reflects whatever character the ACTIVE layout maps that key to
+      // (e.g. Cyrillic "х" for the same physical key as "[" on a Russian
+      // layout), which silently broke every one of these on a non-US
+      // layout. Pure control keys (Enter/Escape/Arrow*/Delete/Backspace)
+      // aren't remapped by layout, so `ev.key` stays correct for those.
+      if ((ev.ctrlKey || ev.metaKey) && ev.code === "KeyZ") {
         ev.preventDefault();
         ev.shiftKey ? redo() : undo();
         return;
@@ -3458,25 +3533,30 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         if (next) switchTo(next.id);
         return;
       }
-      if ((ev.key === "[" || ev.key === "]") && mode === "stamp") {
+      if ((ev.code === "BracketLeft" || ev.code === "BracketRight") && mode === "stamp") {
         ev.preventDefault();
         const min = Math.max(2, Math.round(Math.min(iw, ih) * 0.0012));
         const max = Math.round(Math.min(iw, ih) * 0.15);
-        setBrushRadius((r) => Math.round(Math.min(max, Math.max(min, r * (ev.key === "]" ? 1.15 : 1 / 1.15)))));
+        setBrushRadius((r) => Math.round(Math.min(max, Math.max(min, r * (ev.code === "BracketRight" ? 1.15 : 1 / 1.15)))));
       }
-      else if (["+", "=", "-", "_"].includes(ev.key) && mode === "stamp") {
+      else if ((ev.code === "Equal" || ev.code === "Minus") && mode === "stamp") {
         ev.preventDefault();
         const min = Math.max(2, Math.round(Math.min(iw, ih) * 0.0012));
         const max = Math.round(Math.min(iw, ih) * 0.15);
-        const grow = ev.key === "+" || ev.key === "=";
+        const grow = ev.code === "Equal";
         setBrushRadius((r) => Math.round(Math.min(max, Math.max(min, r * (grow ? 1.15 : 1 / 1.15)))));
       }
-      else if (ev.key === "[" || ev.key === "]") {
-        if (mode !== "crop") return;
+      else if (ev.code === "BracketLeft" || ev.code === "BracketRight") {
+        // available in view mode too, not just crop — rotate90 only touches
+        // rect/view (the same state view mode already renders from), so it
+        // works identically without needing to open the crop UI first; stamp
+        // mode still claims [ / ] for brush size (handled above, returns
+        // before reaching here).
+        if (mode !== "crop" && mode !== "view") return;
         ev.preventDefault();
-        rotate90(ev.key === "]" ? 1 : -1);
+        rotate90(ev.code === "BracketRight" ? 1 : -1);
       }
-      else if (ev.key.toLowerCase() === "s" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+      else if (ev.code === "KeyS" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
         if (mode !== "view") return;
         ev.preventDefault();
         setMode("stamp");
@@ -3487,8 +3567,8 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         setStamp((prev) => prev.filter((_, i) => i !== selectedStroke));
         setSelectedStroke(null);
       }
-      else if (/^[0-5]$/.test(ev.key)) {
-        const n = parseInt(ev.key, 10);
+      else if (/^Digit[0-5]$/.test(ev.code)) {
+        const n = parseInt(ev.code.slice(5), 10);
         onRate(photo.id, n);
         toast(n ? `Rated ${"★".repeat(n)}` : "Rating cleared");
       }
@@ -3499,6 +3579,16 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo, selectedStroke, snapshot]);
 
   const theta = view ? view.theta : 0;
+  // Before/After: what GLImage actually renders — untouched adjust/stamp
+  // while comparing, the real ones otherwise. Crop/rotation (rect/view)
+  // stay exactly as-is either way, so this compares color+retouch work
+  // against the original within the SAME framing, not the literal
+  // as-shot file. `adjust`/`stamp` unchanged (new object/array only
+  // allocated while actually comparing) so this never affects anything
+  // else that reads Editor's own `adjust`/`stamp` state directly (undo,
+  // currentEdits, the DevelopPanel sliders, …).
+  const displayAdjust = compareBefore ? defaultAdjust() : adjust;
+  const displayStamp = compareBefore ? EMPTY_STAMP : stamp;
   const rot90Steps = Math.round(theta / 90);
   const fineTheta = Math.round((theta - rot90Steps * 90) * 10) / 10;
   const outW = rect && view ? Math.round(Math.min(iw, rect.w / view.k)) : 0;
@@ -3507,62 +3597,84 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   return (
     <div className="editor">
       <div className="topbar">
-        <button className="btn ghost" onClick={exit}>{I.back} Library</button>
+        <Tip text="Back to Library">
+          <button className="btn ghost icon" onClick={exit} aria-label="Back to Library">{I.back}</button>
+        </Tip>
         <div style={{ color: "var(--muted)", fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {photo.name}
         </div>
         <div className="spacer" />
         {busyExport && <div className="topbar-progress">{busyExport}</div>}
-        <button
-          className="btn ghost"
-          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          onClick={onToggleTheme}
-        >
-          {theme === "dark" ? I.sun : I.moon}
-        </button>
-        <button className="btn ghost" onClick={reset}>Reset</button>
+        {(!isDefaultAdjust(adjust) || stamp.length > 0) && (
+          <Tip text="Hold to compare with the original (\)">
+            <button
+              className={`btn ghost icon ${compareBefore ? "active" : ""}`}
+              onPointerDown={(e) => { e.preventDefault(); setCompareBefore(true); }}
+              onPointerUp={() => setCompareBefore(false)}
+              onPointerLeave={() => setCompareBefore(false)}
+              onPointerCancel={() => setCompareBefore(false)}
+              aria-label="Hold to compare with the original"
+            >
+              {I.compare}
+            </button>
+          </Tip>
+        )}
         {mode === "view" ? (
           <>
-            <button className="btn ghost" onClick={() => setMode("stamp")} title="Clone stamp (S)">
-              {/* a rubber-stamp silhouette (ink-pad base + arched body + T
-                  handle) — distinct from a generic plus-in-circle, which
-                  reads as a "heal"/"add" icon rather than "clone stamp" in
-                  every other photo editor's own tool palette */}
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="4" y="17" width="16" height="4" rx="1"/><path d="M7 17v-2a5 5 0 0 1 10 0v2"/><path d="M12 10V5M9 5h6"/></svg>
-              Stamp
-            </button>
-            <button className="btn primary" onClick={() => setMode("crop")} title="Open crop tools">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
-              Crop
-            </button>
+            <Tip text="Crop">
+              <button className="btn ghost icon" onClick={() => setMode("crop")} aria-label="Crop">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+              </button>
+            </Tip>
+            <Tip text="Clone stamp (S)">
+              <button className="btn ghost icon" onClick={() => setMode("stamp")} aria-label="Clone stamp">
+                {/* "echo copy": a solid circle (the paint) with a fainter dashed
+                    duplicate offset behind it (the source) — reads as "this is
+                    a copy of that" rather than a literal stamp-the-object
+                    silhouette, which tested poorly at this size. */}
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="15" cy="9" r="5.3" strokeDasharray="2 2" opacity=".55"/><circle cx="10" cy="14" r="5.3"/></svg>
+              </button>
+            </Tip>
           </>
         ) : (
-          <button className="btn primary" onClick={apply} title="Apply (Enter)">Done</button>
+          <Tip text="Apply (Enter)">
+            <button className="btn ghost icon" onClick={apply} aria-label="Apply">{I.done}</button>
+          </Tip>
         )}
-        <button
-          className="btn"
-          onClick={async () => {
-            // commit live edits (crop + adjust + stamp) first — otherwise a
-            // tweak made without hitting Done/Enter first gets left behind.
-            // onApply() queues an async setPhotos that isn't flushed yet, so
-            // the batch-selection branch can't just re-read shared state for
-            // THIS photo — hand it the fresh edits directly instead.
-            const [e, preview] = await buildEdits();
-            onApply(e, preview);
-            if (selected && selected.size > 0) onExportSelected(photo.id, e);
-            else onExport(e);
-          }}
-          title={selected && selected.size > 0 ? `Export ${selected.size} selected photos` : "Export this photo"}
-        >
-          {I.export} Export{selected && selected.size > 0 ? ` ${selected.size}` : ""}
-        </button>
+        <Tip text="Reset all edits">
+          <button className="btn ghost icon" onClick={reset} aria-label="Reset all edits">{I.reset}</button>
+        </Tip>
+        <Tip text={selected && selected.size > 0 ? `Export ${selected.size} selected photos` : "Export this photo"}>
+          <button
+            className="btn ghost icon"
+            onClick={async () => {
+              // commit live edits (crop + adjust + stamp) first — otherwise a
+              // tweak made without hitting Done/Enter first gets left behind.
+              // onApply() queues an async setPhotos that isn't flushed yet, so
+              // the batch-selection branch can't just re-read shared state for
+              // THIS photo — hand it the fresh edits directly instead.
+              const [e, preview] = await buildEdits();
+              onApply(e, preview);
+              if (selected && selected.size > 0) onExportSelected(photo.id, e);
+              else onExport(e);
+            }}
+            aria-label="Export"
+          >
+            {I.export}
+          </button>
+        </Tip>
+        <Tip text={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}>
+          <button className="btn ghost icon" onClick={onToggleTheme} aria-label="Toggle theme">
+            {theme === "dark" ? I.sun : I.moon}
+          </button>
+        </Tip>
       </div>
 
       <div className="ed-body">
       <div
-        className={`stage ${anim ? "anim" : ""}`}
+        className="stage"
         ref={stageRef}
-        onPointerDown={startDrag("pan")}
+        onPointerDown={mode === "crop" ? startDrag("image") : startDrag("pan")}
         onDoubleClick={() => {
           if (!view) return;
           // in crop mode, .cropframe's own onDoubleClick (fit-to-crop-area)
@@ -3591,12 +3703,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               transform: `translate(${view.icx - iw / 2}px, ${view.icy - ih / 2}px) rotate(${theta}deg) scale(${view.k})`,
             }}
           >
-            <GLImage className="base" src={editSrcURL(photo)} adjust={adjust} draggable={false} />
+            <GLImage className="base" src={editSrcURL(photo)} adjust={displayAdjust} stamp={displayStamp} texRegion={baseTexRegion} draggable={false} />
             {tile && (
               <GLImage
                 className="tileimg"
                 src={tile.url}
-                adjust={adjust}
+                adjust={displayAdjust}
+                stamp={displayStamp}
+                texRegion={tileTexRegion}
                 draggable={false}
                 style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
               />
@@ -3618,9 +3732,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               <GLImage
                 className="base"
                 src={editSrcURL(photo)}
-                adjust={adjust}
-                stamp={stamp}
-                draft={mode === "stamp" ? draft : null}
+                adjust={displayAdjust}
+                stamp={displayStamp}
+                draft={mode === "stamp" && !compareBefore ? draft : null}
                 texRegion={baseTexRegion}
                 draggable={false}
               />
@@ -3628,9 +3742,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 <GLImage
                   className="tileimg"
                   src={tile.url}
-                  adjust={adjust}
-                  stamp={stamp}
-                  draft={mode === "stamp" ? draft : null}
+                  adjust={displayAdjust}
+                  stamp={displayStamp}
+                  draft={mode === "stamp" && !compareBefore ? draft : null}
                   texRegion={tileTexRegion}
                   draggable={false}
                   style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
@@ -3657,6 +3771,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 opacity={stampOpacity}
                 gesturing={gesturing}
                 editPixelsRef={editPixelsRef}
+                spaceRef={spaceRef}
               />
             )}
           </div>
@@ -3665,7 +3780,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
           <div
             className={`cropframe ${drag.current?.mode === "image" ? "grabbing" : ""}`}
             style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
-            onPointerDown={startDrag("image")}
+            onPointerDown={dragOrPan("image")}
             onDoubleClick={(e) => {
               e.stopPropagation(); // otherwise bubbles to .stage's own onDoubleClick below, which fits the whole photo instead
               // animate=false: an animated refit here is a big, frequent
@@ -3688,14 +3803,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               <div className="h" style={{ top: "33.333%" }} />
               <div className="h" style={{ top: "66.666%" }} />
             </div>
-            <div className="handle corner h-nw" onPointerDown={startDrag("nw")} />
-            <div className="handle corner h-ne" onPointerDown={startDrag("ne")} />
-            <div className="handle corner h-sw" onPointerDown={startDrag("sw")} />
-            <div className="handle corner h-se" onPointerDown={startDrag("se")} />
-            <div className="handle edge h-n" onPointerDown={startDrag("n")} />
-            <div className="handle edge h-s" onPointerDown={startDrag("s")} />
-            <div className="handle edge h-e" onPointerDown={startDrag("e")} />
-            <div className="handle edge h-w" onPointerDown={startDrag("w")} />
+            <div className="handle corner h-nw" onPointerDown={dragOrPan("nw")} />
+            <div className="handle corner h-ne" onPointerDown={dragOrPan("ne")} />
+            <div className="handle corner h-sw" onPointerDown={dragOrPan("sw")} />
+            <div className="handle corner h-se" onPointerDown={dragOrPan("se")} />
+            <div className="handle edge h-n" onPointerDown={dragOrPan("n")} />
+            <div className="handle edge h-s" onPointerDown={dragOrPan("s")} />
+            <div className="handle edge h-e" onPointerDown={dragOrPan("e")} />
+            <div className="handle edge h-w" onPointerDown={dragOrPan("w")} />
           </div>
         )}
         </div>
@@ -3708,52 +3823,35 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
 
       {mode === "crop" && (
       <div className="toolbelt">
-        {levelOpts && (
-          <div className="level-opts">
-            <span className="lo-label">Auto level options</span>
-            {levelOpts.map((o, i) => {
-              const active = Math.abs(theta - o.angle) < 0.15;
-              return (
-                <button
-                  key={i}
-                  className={`chip ${active ? "on" : ""}`}
-                  onClick={() => applyLevelOption(o.angle)}
-                >
-                  {o.angle > 0 ? "+" : ""}{o.angle.toFixed(1)}° · {o.tag}
-                </button>
-              );
-            })}
-            <button className="lo-close" title="Hide options" onClick={() => setLevelOpts(null)}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-            </button>
-          </div>
-        )}
         <div className="aspects">
           {ASPECTS.map((a) => (
             <button key={a.key} className={`chip ${aspect === a.key ? "on" : ""}`} onClick={() => pickAspect(a.key)}>
               {flipped && a.v && a.v !== 1 ? swapLabel(a.label) : a.label}
             </button>
           ))}
-          <button
-            className="chip icon"
-            title="Swap portrait / landscape"
-            onClick={toggleFlip}
-            disabled={aspect === "1:1" || aspect === "free" || aspect === "orig"}
-            style={flipped ? { color: "var(--accent)", borderColor: "var(--accent)" } : undefined}
-          >
-            {I.flip}
-          </button>
-          <button className="chip icon" title="Rotate 90° left" onClick={() => rotate90(-1)}>
-            {I.rotateLeft}
-          </button>
-          <button className="chip icon" title="Rotate 90° right" onClick={() => rotate90(1)}>
-            {I.rotateRight}
-          </button>
+          <Tip text="Swap portrait / landscape">
+            <button
+              className="chip icon"
+              onClick={toggleFlip}
+              disabled={aspect === "1:1" || aspect === "free" || aspect === "orig"}
+              style={flipped ? { color: "var(--accent)", borderColor: "var(--accent)" } : undefined}
+              aria-label="Swap portrait / landscape"
+            >
+              {I.flip}
+            </button>
+          </Tip>
+          <Tip text="Rotate 90° left">
+            <button className="chip icon" onClick={() => rotate90(-1)} aria-label="Rotate 90° left">
+              {I.rotateLeft}
+            </button>
+          </Tip>
+          <Tip text="Rotate 90° right">
+            <button className="chip icon" onClick={() => rotate90(1)} aria-label="Rotate 90° right">
+              {I.rotateRight}
+            </button>
+          </Tip>
         </div>
         <div className="rot-row">
-          <button className="btn" onClick={autoLevel} disabled={leveling}>
-            {leveling ? <span className="spin" /> : I.level} Auto level
-          </button>
           <div className="rot-slider">
             <div className="notch" />
             <input
@@ -4072,10 +4170,12 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, onEx
 
         {NATIVE && (
           <div className="field">
-            <label className="chk" title="Adds camera, lens and date to the file">
-              <input type="checkbox" checked={keepExif} onChange={(e) => setKeepExif(e.target.checked)} />
-              Keep EXIF
-            </label>
+            <Tip text="Adds camera, lens and date to the file">
+              <label className="chk">
+                <input type="checkbox" checked={keepExif} onChange={(e) => setKeepExif(e.target.checked)} />
+                Keep EXIF
+              </label>
+            </Tip>
           </div>
         )}
 
@@ -4107,7 +4207,7 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, onEx
 
         {onSavePreset && (
           <div className="field">
-            <label title="Remembers folder, format and size">Save as preset</label>
+            <Tip text="Remembers folder, format and size"><label>Save as preset</label></Tip>
             <div className="controls">
               <div className="numinput" style={{ flex: 1 }}>
                 <input
@@ -4118,19 +4218,20 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, onEx
                   style={{ fontFamily: "var(--sans)" }}
                 />
               </div>
-              <button
-                className="btn"
-                disabled={!presetName.trim() || exporting}
-                title="Pick a folder and save"
-                onClick={async () => {
-                  const ok = await onSavePreset({
-                    name: presetName.trim(), format, targetMB: targetMBn, scale, template, keepExif,
-                  });
-                  if (ok) setPresetName("");
-                }}
-              >
-                Save…
-              </button>
+              <Tip text="Pick a folder and save">
+                <button
+                  className="btn"
+                  disabled={!presetName.trim() || exporting}
+                  onClick={async () => {
+                    const ok = await onSavePreset({
+                      name: presetName.trim(), format, targetMB: targetMBn, scale, template, keepExif,
+                    });
+                    if (ok) setPresetName("");
+                  }}
+                >
+                  Save…
+                </button>
+              </Tip>
             </div>
           </div>
         )}
@@ -4206,7 +4307,7 @@ export default function App() {
   const [selectMode, setSelectMode] = useState(false);
   const [activeFolder, setActiveFolder] = useState("__all__");
   const [thumb, setThumb] = useState(164);
-  const [sortDesc, setSortDesc] = useState(true);
+  const [sortDesc, setSortDesc] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [exportItems, setExportItems] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -4220,7 +4321,6 @@ export default function App() {
   const [minRating, setMinRating] = useState(0);   // sidebar rating filter
   const [busyExport, setBusyExport] = useState(null);
   const fileInput = useRef(null);
-  const folderInput = useRef(null);
   const dragCount = useRef(0);
   const toastTimer = useRef(null);
   const busyExportTimer = useRef(null);
@@ -4405,18 +4505,17 @@ export default function App() {
     toast(`Imported ${loaded.length} photo${loaded.length > 1 ? "s" : ""}`);
   }, [toast]);
 
-  const importPhotos = async () => {
-    if (NATIVE) addNativeRecords(await window.meridian.pickFiles());
-    else fileInput.current?.click();
-  };
-  const importFolder = async () => {
+  const importPhotosOrFolder = async () => {
     if (NATIVE) {
-      const { root, records } = await window.meridian.pickFolder();
-      if (!root) return;
-      setWatchedRoots((prev) => (prev.includes(root) ? prev : [...prev, root]));
+      const paths = await window.meridian.pickFilesOrFolder();
+      if (!paths?.length) return;
+      const { records, roots } = await window.meridian.importPaths(paths);
+      if (roots?.length) {
+        setWatchedRoots((prev) => [...prev, ...roots.filter((r) => !prev.includes(r))]);
+      }
       await addNativeRecords(records);
     } else {
-      folderInput.current?.click();
+      fileInput.current?.click();
     }
   };
 
@@ -4505,26 +4604,44 @@ export default function App() {
   };
   const clearSelection = () => { setSelected(new Set()); setSelectMode(false); };
 
-  const deleteSelected = () => {
-    const deleted = photosRef.current.filter((p) => selected.has(p.id));
-    let affected = [];
-    if (NATIVE) {
-      // a watched folder would re-add these photos on the next scan,
-      // so removing its photos also stops syncing that folder
-      affected = watchedRoots.filter((root) => deleted.some((p) => isUnder(p.path, root)));
-      if (affected.length) {
-        for (const root of affected) window.meridian.unwatchRoot(root);
-        setWatchedRoots((prev) => prev.filter((r) => !affected.includes(r)));
-      }
-      setPhotos((prev) => prev.filter((p) => !selected.has(p.id)));
-    } else {
-      setPhotos((prev) => prev.filter((p) => !selected.has(p.id)));
-    }
+  /* Esc cancels a library selection — but not while the Editor, a context
+     menu, or the export dialog is open, since each of those already owns
+     Esc for its own close/cancel behavior. */
+  useEffect(() => {
+    if (editingId || ctxMenu || exportItems) return;
+    const onKey = (e) => {
+      if (e.key !== "Escape" || selected.size === 0) return;
+      const tag = e.target?.tagName;
+      const inTextField = (tag === "INPUT" && e.target.type !== "range") || tag === "TEXTAREA";
+      if (!inTextField) clearSelection();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editingId, ctxMenu, exportItems, selected]);
+
+  const undoResetSelected = (prevState) => {
+    setPhotos((prev) => prev.map((p) => {
+      const found = prevState.find((x) => x.id === p.id);
+      return found ? { ...p, edits: found.edits, previewUrl: found.previewUrl } : p;
+    }));
+    for (const p of prevState) cachePreviewToDisk(p.path, p.previewUrl ?? null);
+    toast("Restored edits");
+  };
+
+  /* Bulk equivalent of the Editor's own per-photo "Reset" button (onApply
+     (null, null) there) — clears crop/adjust/stamp for every selected
+     photo at once. Captures each photo's previous edits/previewUrl first
+     so the toast's Undo action can restore them exactly. */
+  const resetSelected = () => {
+    const targets = photosRef.current.filter((p) => selected.has(p.id));
+    if (!targets.length) return;
+    const prevState = targets.map((p) => ({ id: p.id, path: p.path, edits: p.edits, previewUrl: p.previewUrl }));
+    setPhotos((prev) => prev.map((p) => (selected.has(p.id) ? { ...p, edits: null, previewUrl: null } : p)));
+    for (const p of targets) cachePreviewToDisk(p.path, null);
     toast(
-      `Removed ${deleted.length} from library${NATIVE ? " (files stay on disk)" : ""}`,
-      { label: "Undo", fn: () => undoRemoval(deleted, affected) }
+      `Reset ${targets.length} photo${targets.length === 1 ? "" : "s"}`,
+      { label: "Undo", fn: () => undoResetSelected(prevState) }
     );
-    clearSelection();
   };
 
   /* ---- migrate: folders imported before watching existed start syncing
@@ -4574,39 +4691,6 @@ export default function App() {
       { label: "Undo", fn: () => undoRemoval(targets, unwatched) }
     );
   }, [rootForGroup, toast, undoRemoval]);
-
-  /* ---- batch auto-level for the selection ---- */
-  const batchLevel = useCallback(async () => {
-    const ids = [...selected];
-    clearSelection();
-    let done = 0, fixed = 0;
-    for (const id of ids) {
-      const p = photosRef.current.find((x) => x.id === id);
-      done++;
-      setBusyExport(`Auto level ${done} / ${ids.length}…`);
-      if (!p) continue;
-      try {
-        const src = proxyURL(p);
-        const cands = await detectHorizonCandidates(src);
-        const a = cands[0]?.angle || 0;
-        if (!a) continue;
-        // largest full-aspect crop that the rotated frame can cover
-        const t = rad(Math.abs(a));
-        const f = Math.max(
-          Math.cos(t) + (p.h / p.w) * Math.sin(t),
-          (p.w / p.h) * Math.sin(t) + Math.cos(t)
-        );
-        const edits = { theta: a, qcx: 0, qcy: 0, cw: p.w / f, ch: p.h / f };
-        const preview = await bakePreview(src, p.w, p.h, edits, 560);
-        cachePreviewToDisk(p.path, preview);
-        setPhotos((prev) => prev.map((x) => (x.id === id ? { ...x, edits, previewUrl: preview } : x)));
-        fixed++;
-      } catch {}
-    }
-    setBusyExport(null);
-    toast(`Leveled ${fixed} of ${ids.length} photo${ids.length > 1 ? "s" : ""}`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, toast]);
 
   /* ---- ratings ---- */
   const setRating = useCallback((id, rating) => {
@@ -4801,52 +4885,64 @@ export default function App() {
 
       <div className="topbar">
         <div className="brand"><span className="dot" /><span className="name">SPLICER LAB</span></div>
-        <button className="btn" onClick={importPhotos}>{I.upload} Import photos</button>
-        <button className="btn" onClick={importFolder}>{I.folder} Import folder</button>
+        <Tip text="Import photos or a folder">
+          <button className="btn ghost icon" onClick={importPhotosOrFolder} aria-label="Import photos or a folder">{I.upload}</button>
+        </Tip>
         {!NATIVE && (
-          <>
-            <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={onPickFiles} />
-            <input ref={folderInput} type="file" webkitdirectory="" directory="" multiple hidden onChange={onPickFiles} />
-          </>
+          <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={onPickFiles} />
         )}
         <div className="spacer" />
         {busyExport && <div className="topbar-progress">{busyExport}</div>}
-        <button
-          className="btn ghost"
-          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-        >
-          {theme === "dark" ? I.sun : I.moon}
-        </button>
         {photos.length > 0 && (
           <>
-            <button className="btn ghost" title="Sort by date added" onClick={() => setSortDesc((s) => !s)}>
-              {I.sort} {sortDesc ? "Newest" : "Oldest"}
-            </button>
+            <Tip text={sortDesc ? "Sort: Newest first" : "Sort: Oldest first"}>
+              <button className="btn ghost icon" onClick={() => setSortDesc((s) => !s)} aria-label="Toggle sort order">
+                {I.sort}
+              </button>
+            </Tip>
             <div className="thumbslider">
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
               <input
                 type="range" className="rot" style={{ width: 110 }}
                 min={96} max={280} value={thumb}
                 onChange={(e) => setThumb(+e.target.value)}
               />
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
             </div>
             {selected.size > 0 ? (
               <>
-                <span style={{ color: "var(--muted)", fontSize: 13 }}>{selected.size} selected</span>
-                <button className="btn" onClick={batchLevel} title="Auto-level all selected photos">{I.level} Level</button>
-                <button className="btn" onClick={() => exportSelected()}>{I.export} Export</button>
-                <button className="btn danger" onClick={deleteSelected}>{I.trash} Remove</button>
-                <button className="btn ghost" onClick={clearSelection}>Cancel</button>
+                {/* only the left side needs extra room: the slider has no
+                    inset of its own, while the icon buttons on the right
+                    already carry ~10px of inset around their glyph — adding
+                    padding on both sides double-counted that and pushed the
+                    right gap too wide. */}
+                <span style={{ color: "var(--muted)", fontSize: 13, paddingLeft: 10 }}>{selected.size}</span>
+                <Tip text="Cancel selection">
+                  <button className="btn ghost icon" onClick={clearSelection} aria-label="Cancel selection">{I.close}</button>
+                </Tip>
+                <Tip text="Reset all edits on the selected photos">
+                  <button className="btn ghost icon" onClick={resetSelected} aria-label="Reset selected">{I.reset}</button>
+                </Tip>
+                <Tip text={`Export ${selected.size} selected photos`}>
+                  <button className="btn ghost icon" onClick={() => exportSelected()} aria-label="Export selected">{I.export}</button>
+                </Tip>
               </>
             ) : (
-              <button className={`btn ${selectMode ? "active" : ""}`} onClick={() => setSelectMode((s) => !s)}>
-                Select
-              </button>
+              <Tip text="Select photos">
+                <button className={`btn ghost icon ${selectMode ? "active" : ""}`} onClick={() => setSelectMode((s) => !s)} aria-label="Select photos">
+                  {I.select}
+                </button>
+              </Tip>
             )}
           </>
         )}
+        <Tip text={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}>
+          <button
+            className="btn ghost icon"
+            onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+            aria-label="Toggle theme"
+          >
+            {theme === "dark" ? I.sun : I.moon}
+          </button>
+        </Tip>
       </div>
 
       <div className="body">
@@ -4860,19 +4956,21 @@ export default function App() {
           <div className="side-label">Sort by rating</div>
           <div className="side-rating">
             {[1, 2, 3, 4, 5].map((n) => (
-              <button
-                key={n}
-                className={n <= minRating ? "lit" : ""}
-                title={`Show ★${n} and up`}
-                onClick={() => setMinRating((m) => (m === n ? 0 : n))}
-              >
-                ★
-              </button>
+              <Tip key={n} text={`Show ★${n} and up`}>
+                <button
+                  className={n <= minRating ? "lit" : ""}
+                  onClick={() => setMinRating((m) => (m === n ? 0 : n))}
+                >
+                  ★
+                </button>
+              </Tip>
             ))}
             {minRating > 0 && (
-              <button className="clear" onClick={() => setMinRating(0)} title="Clear filter">
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-              </button>
+              <Tip text="Clear filter">
+                <button className="clear" onClick={() => setMinRating(0)} aria-label="Clear filter">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+              </Tip>
             )}
           </div>
           {folderTree.length > 0 && <div className="side-label">Folders</div>}
@@ -4880,8 +4978,8 @@ export default function App() {
             const { label: f, depth, name, count } = node;
             const isRoot = depth === 0;
             return (
+              <Tip key={f} text={`${f} · right-click to remove`}>
               <button
-                key={f}
                 className={`side-item ${activeFolder === f ? "active" : ""}`}
                 style={{ paddingLeft: 10 + depth * 16 }}
                 onClick={() => setActiveFolder(f)}
@@ -4889,7 +4987,6 @@ export default function App() {
                   e.preventDefault();
                   setCtxMenu({ x: e.clientX, y: e.clientY, type: "folder", label: f, name });
                 }}
-                title={`${f} · right-click to remove`}
               >
                 {isRoot ? I.folder : (
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ opacity: .6 }}><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
@@ -4897,6 +4994,7 @@ export default function App() {
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
                 <span className="count">{count}</span>
               </button>
+              </Tip>
             );
           })}
         </div>
@@ -4927,10 +5025,9 @@ export default function App() {
               <h2>{libLoaded ? "Your library is empty" : "Loading library…"}</h2>
               {libLoaded && (
                 <>
-                  <p>Drop photos or folders anywhere in this window, or use the import buttons. Originals on disk are never modified — every edit can be reverted.</p>
+                  <p>Drop photos or folders anywhere in this window, or use the import button. Originals on disk are never modified — every edit can be reverted.</p>
                   <div className="row">
-                    <button className="btn primary" onClick={importPhotos}>{I.upload} Import photos</button>
-                    <button className="btn" onClick={importFolder}>{I.folder} Import folder</button>
+                    <button className="btn primary" onClick={importPhotosOrFolder}>{I.upload} Import photos or a folder</button>
                   </div>
                 </>
               )}
@@ -4950,29 +5047,29 @@ export default function App() {
                   };
                   const isSel = selected.has(p.id);
                   return (
-                    <div
-                      key={p.id}
-                      style={cellStyle}
-                      className={`cell ${isSel ? "selected" : ""} ${selectMode || selected.size > 0 ? "selectmode" : ""}`}
-                      onClick={(e) => cellClick(p, idx, e)}
-                      onContextMenu={(e) => {
-                        if (!NATIVE) return;
-                        e.preventDefault();
-                        openContextMenu(p.id, e.clientX, e.clientY);
-                      }}
-                      onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
-                      title={p.name}
-                    >
-                      <Thumb src={p.previewUrl || thumbURL(p)} alt={p.name} />
+                    <Tip key={p.id} text={p.name}>
                       <div
-                        className="check"
-                        onClick={(e) => { e.stopPropagation(); toggleSelect(p.id); anchorIdx.current = idx; }}
+                        style={cellStyle}
+                        className={`cell ${isSel ? "selected" : ""} ${selectMode || selected.size > 0 ? "selectmode" : ""}`}
+                        onClick={(e) => cellClick(p, idx, e)}
+                        onContextMenu={(e) => {
+                          if (!NATIVE) return;
+                          e.preventDefault();
+                          openContextMenu(p.id, e.clientX, e.clientY);
+                        }}
+                        onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
                       >
-                        {isSel && I.check}
+                        <Thumb src={p.previewUrl || thumbURL(p)} alt={p.name} />
+                        <div
+                          className="check"
+                          onClick={(e) => { e.stopPropagation(); toggleSelect(p.id); anchorIdx.current = idx; }}
+                        >
+                          {isSel && I.check}
+                        </div>
+                        {p.edits && <div className="badge">Edited</div>}
+                        {p.rating > 0 && <div className="rbadge">{"★".repeat(p.rating)}</div>}
                       </div>
-                      {p.edits && <div className="badge">Edited</div>}
-                      {p.rating > 0 && <div className="rbadge">{"★".repeat(p.rating)}</div>}
-                    </div>
+                    </Tip>
                   );
                 })}
               </div>
@@ -5047,13 +5144,15 @@ export default function App() {
                 <span className="cm-name">{pr.name}</span>
                 <span className="cm-sub">≤{pr.targetMB} MB · {pr.format.toUpperCase()} · {pr.scale}% → {baseName(pr.dir)}</span>
               </div>
-              <button
-                className="cm-del"
-                title="Delete preset"
-                onClick={(e) => { e.stopPropagation(); deletePreset(pr.id); }}
-              >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
-              </button>
+              <Tip text="Delete preset">
+                <button
+                  className="cm-del"
+                  onClick={(e) => { e.stopPropagation(); deletePreset(pr.id); }}
+                  aria-label="Delete preset"
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+              </Tip>
             </div>
           ))}
           {presets.length === 0 && (

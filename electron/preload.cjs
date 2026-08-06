@@ -1,8 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("meridian", {
-  pickFiles: () => ipcRenderer.invoke("pick-files"),
-  pickFolder: () => ipcRenderer.invoke("pick-folder"),
+  pickFilesOrFolder: () => ipcRenderer.invoke("pick-files-or-folder"),
   importPaths: (paths) => ipcRenderer.invoke("import-paths", paths),
   watchRoots: (roots) => ipcRenderer.invoke("watch-roots", roots),
   unwatchRoot: (root) => ipcRenderer.invoke("unwatch-root", root),

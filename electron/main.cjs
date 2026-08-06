@@ -511,10 +511,14 @@ app.on("window-all-closed", () => {
 
 /* ---------------- IPC: importing ---------------- */
 
-ipcMain.handle("pick-files", async () => {
+/* One dialog, either kind of pick: macOS lets the user select files AND
+   folders side by side (openFile + openDirectory combined); the renderer
+   feeds whatever comes back into import-paths below, which already knows
+   how to sort files from folders (same code path as drag-and-drop). */
+ipcMain.handle("pick-files-or-folder", async () => {
   const res = await dialog.showOpenDialog({
-    title: "Import photos",
-    properties: ["openFile", "multiSelections"],
+    title: "Import photos or a folder",
+    properties: ["openFile", "openDirectory", "multiSelections"],
     filters: [{
       name: "Images",
       extensions: [
@@ -526,18 +530,7 @@ ipcMain.handle("pick-files", async () => {
     }],
   });
   if (res.canceled) return [];
-  const out = [];
-  for (const p of res.filePaths) {
-    if (!isImg(p)) continue;
-    let size = 0, mtime = 0;
-    try {
-      const st = await fsp.stat(p);
-      size = st.size; mtime = st.mtimeMs;
-    } catch {}
-    allowedFiles.add(p);
-    out.push({ path: p, name: path.basename(p), folder: "", size, mtime });
-  }
-  return out;
+  return res.filePaths;
 });
 
 /* Turn syncing on for a set of existing folder roots (e.g. folders that
@@ -545,19 +538,6 @@ ipcMain.handle("pick-files", async () => {
 ipcMain.handle("watch-roots", (_e, roots) => {
   for (const r of roots || []) watchRoot(r);
   return [...watchers.keys()];
-});
-
-ipcMain.handle("pick-folder", async () => {
-  const res = await dialog.showOpenDialog({
-    title: "Import folder",
-    properties: ["openDirectory"],
-  });
-  if (res.canceled || !res.filePaths.length) return { root: null, records: [] };
-  const dir = res.filePaths[0];
-  const records = [];
-  await scanDir(dir, path.basename(dir), records);
-  watchRoot(dir); // keep the library in sync with this folder from now on
-  return { root: dir, records };
 });
 
 /* Dropped items: mix of files and folders (absolute paths from the renderer) */

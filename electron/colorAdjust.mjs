@@ -22,6 +22,36 @@
    an already-clipped 8-bit sRGB buffer so they can lift/darken existing
    tones but can't reconstruct genuinely blown detail the way
    RAW-domain recovery can.
+
+   LINEAR-LIGHT white balance/exposure/saturation, not straight sRGB:
+   every serious raw/photo pipeline (darktable's exposure & white-balance
+   modules, RawTherapee, Lightroom's Camera Raw engine) does these three
+   specifically in LINEAR light, not on the gamma-encoded display values —
+   because that's what they physically are: white balance is a per-channel
+   gain on how much of each color of LIGHT hit the sensor, exposure is a
+   gain on how much light there was, period, and Rec.709 luma weights
+   (used here for saturation's own "distance from gray") are themselves
+   only defined for linear RGB. Multiplying the GAMMA-encoded (sRGB, ~x^
+   (1/2.4)-shaped) value by a stops factor instead — which is what this
+   file used to do — means the same physical gain lands very differently
+   depending on where a pixel already sits on that curve: shadows/
+   midtones swing much harder than a true exposure change would (gamma
+   compresses a lot of real dynamic range into a small band of code
+   values there), while highlights clip almost immediately. That's
+   exactly the "touchy/imprecise, highlights clip too fast" character
+   reported firsthand ("не очень точные... изменения не плавные").
+   srgbToLinear/linearToSrgb below are the standard IEC 61966-2-1 sRGB
+   transfer function (the real piecewise curve, not a naive x^2.2), not
+   darktable's own source (GPL, and not something to fold into this
+   codebase's license) — this is the same publicly-documented transfer
+   function every color-managed tool implements from the spec.
+   Contrast and Highlights/Shadows deliberately STAY in gamma/display
+   space: they're each already a "how should this look on screen"
+   judgment (a simple contrast slider's usual convention pivots on the
+   displayed midpoint; the highlight/shadow luma mask is explicitly a
+   perceived-brightness classifier), not a physical light quantity, so
+   there's no equivalent "this is measurably wrong" case for moving them
+   the way there was for exposure/white-balance/saturation.
    ============================================================ */
 
 const EV_RANGE = 2.5;              // exposure ±100% -> ±2.5 stops
@@ -86,25 +116,58 @@ function smoothstep(edge0, edge1, x) {
   return t * t * (3 - 2 * t);
 }
 
+/* Standard sRGB (IEC 61966-2-1) transfer function, not a naive x^2.2 —
+   the real curve every color-managed tool uses to go between the
+   gamma-encoded display values a file stores and the physically-linear
+   light those values represent. See this module's header for why white
+   balance/exposure/saturation specifically need to happen on the LINEAR
+   side of this conversion. Negative inputs are clamped before the pow()
+   (can otherwise happen transiently from float math) since a fractional
+   power of a negative base is NaN. */
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow(Math.max(0, (c + 0.055) / 1.055), 2.4);
+}
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(Math.max(0, c), 1 / 2.4) - 0.055;
+}
+
+/* srgbToLinear precomputed for every one of the 256 possible input BYTE
+   values — the buffer this module reads is always 8-bit, so there's no
+   need to call Math.pow twice per channel per pixel when the input only
+   ever takes 256 distinct values. (linearToSrgb, the OUTPUT side, stays
+   a direct call: by then the value is a continuous float, not one of a
+   fixed 256 levels, so a lookup table doesn't apply the same way.) A
+   module-level constant, not part of compileAdjust()'s result — it
+   doesn't depend on any adjust setting, only on the fixed sRGB curve
+   itself, so it's built once total, not once per adjust change. */
+const SRGB_TO_LINEAR_LUT = (() => {
+  const t = new Float64Array(256);
+  for (let i = 0; i < 256; i++) t[i] = srgbToLinear(i / 255);
+  return t;
+})();
+
 /* r,g,b: 0-255 in, 0-255 out. `c` is a compileAdjust() result.
    KEEP IN SYNC WITH the GLSL fragment shader in src/App.jsx (GLImage). */
 export function adjustPixel(r, g, b, c) {
-  let cr = r / 255, cg = g / 255, cb = b / 255;
+  // white balance, exposure, saturation: all physically multiplicative
+  // gains on LIGHT, done here in LINEAR space — see this module's header.
+  let lr = SRGB_TO_LINEAR_LUT[r], lg = SRGB_TO_LINEAR_LUT[g], lb = SRGB_TO_LINEAR_LUT[b];
 
-  // white balance
-  cr *= c.wbGainR; cg *= c.wbGainG; cb *= c.wbGainB;
+  lr *= c.wbGainR; lg *= c.wbGainG; lb *= c.wbGainB;
+  lr *= c.exposureGain; lg *= c.exposureGain; lb *= c.exposureGain;
 
-  // saturation: scale each channel's distance from the pixel's own gray
-  // (luminance) value
   if (c.satGain !== 1) {
-    const gray = 0.2126 * cr + 0.7152 * cg + 0.0722 * cb;
-    cr = gray + (cr - gray) * c.satGain;
-    cg = gray + (cg - gray) * c.satGain;
-    cb = gray + (cb - gray) * c.satGain;
+    const gray = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+    lr = gray + (lr - gray) * c.satGain;
+    lg = gray + (lg - gray) * c.satGain;
+    lb = gray + (lb - gray) * c.satGain;
   }
 
-  // exposure: uniform stops-based gain, moves the black point
-  cr *= c.exposureGain; cg *= c.exposureGain; cb *= c.exposureGain;
+  // back to gamma-encoded/display-referred for everything below: each of
+  // these is already a "how should this look on screen" judgment, not a
+  // physical light quantity — see this module's header for why they stay
+  // here rather than also moving into the linear block above.
+  let cr = linearToSrgb(Math.max(0, lr)), cg = linearToSrgb(Math.max(0, lg)), cb = linearToSrgb(Math.max(0, lb));
 
   // contrast: linear pivot around mid-gray
   cr = (cr - 0.5) * (1 + c.contrastAmt) + 0.5;

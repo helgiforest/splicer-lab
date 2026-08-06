@@ -1,24 +1,28 @@
 # Splicer Lab
 
-**A fast, fully local photo editor** — library, non-destructive develop tools, precision crop with auto horizon leveling, clone stamp retouching, and size-targeted export. One app, no bloat, nothing leaves your machine.
+**A fast, fully local photo editor** — library, non-destructive develop tools, precision crop, clone stamp retouching, and size-targeted export. One app, no bloat, nothing leaves your machine.
 
-![Splicer Lab](https://img.shields.io/badge/version-3.0.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+![Splicer Lab](https://img.shields.io/badge/version-3.1.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 
 ## Philosophy
 
-Splicer Lab does a few things and does them properly, instead of trying to be everything. A real photo library, a proper develop module (exposure, color, highlights & shadows, with a live crop-aware histogram), a precision crop with auto horizon leveling, a clone stamp for retouching, and export that hits an exact file size — that's the whole app. No accounts, no cloud processing, no telemetry: everything runs 100% locally, and your photos never leave your computer.
+Splicer Lab does a few things and does them properly, instead of trying to be everything. A real photo library, a proper develop module (exposure, color, highlights & shadows, with a live crop-aware histogram), a precision crop, a clone stamp for retouching, and export that hits an exact file size — that's the whole app. No accounts, no cloud processing, no telemetry: everything runs 100% locally, and your photos never leave your computer.
+
+The name is literal: a **splicer** is the tool an editor used to physically cut and join film — deliberate, mechanical, no undo by default. A **lab** is where that film got developed — a technical workroom, not a showroom. That's the register the whole app is built in: an instrument, not a toy. The Clone Stamp is the clearest expression of it — a raw, honest 1:1 pixel copy like Photoshop's real tool, with **no automatic color correction pretending to be smarter than it is**. If a patch doesn't match, that's a signal to pick a better source, not something for the software to paper over. The same restraint shows up everywhere else: an icon-only toolbar instead of a wall of labeled buttons, a Before/After hold instead of a permanent split-screen, one accent color used exactly once per screen instead of everything shouting for attention at once.
+
+Visually, that's a near-black workroom (`#0B0C0F`) lit by a single warm, amber-gold accent (`#F3C34F`) — the color of a darkroom safelight, not a brand gradient. Thin, precise line icons (1.8px stroke, rounded caps, no fill) stand in for controls the way a lab's own instrument markings would. Quiet, dark, exact — the app gets out of the way of the photo.
 
 ---
 
 ## Features
 
-- **Photo library** that mirrors your real folders — import once and it stays in sync with disk, even while the app is closed. Filter by rating, an "Edited" view, or folder; multi-select for batch level, export, or remove. Originals are **never modified**; every edit is non-destructive.
+- **Photo library** that mirrors your real folders — import once and it stays in sync with disk, even while the app is closed. Filter by rating, an "Edited" view, or folder; multi-select for batch export or reset. Removing a folder from the library (right-click it in the sidebar) never touches the files on disk. Originals are **never modified**; every edit is non-destructive.
 - **Develop module**: Temperature, Tint, Saturation, Exposure, Contrast, Highlights, Shadows, Black/White point — all live, all reversible. A real-time histogram reflects the current crop and shows red clipping bars when the black or white point pushes pixels past 0% or 100%.
-- **Clone Stamp**: paint from any source point to remove or duplicate detail, with automatic color/tone matching so patches blend in instead of leaving a visible seam. Fully non-destructive — edit it again anytime.
-- **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5, flip any of them), rule-of-thirds grid, quarter-turn rotation, a fine ±45° leveling slider, deep-zoom sharpening for pixel-precise framing, full undo/redo.
-- **Auto horizon leveling** via Hough-transform line detection — one click, with alternative angles if the first guess is off, and a batch mode for a whole selection at once.
+- **Clone Stamp**: paint from any source point to duplicate or remove detail — a raw, pixel-for-pixel copy, exactly like Photoshop's real Clone Stamp, with no automatic color correction. Adjustable brush size, feather and opacity. Fully non-destructive — edit it again anytime.
+- **Before/After**: hold Compare (or `\`) to see the untouched original in the exact same crop and framing, then let go to snap back to your edit.
+- **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5, flip any of them), rule-of-thirds grid, quarter-turn rotation (works from the viewer too, not just inside Crop), a fine ±45° leveling slider, deep-zoom sharpening for pixel-precise framing, full undo/redo.
 - **Size-targeted export**: type "9 MB" and Splicer Lab binary-searches the encoder to land just under it. MozJPEG and high-effort WebP, with a live estimate before you save. Save reusable **export presets** (size, format, destination folder) for one-click batch export.
 - **Big files welcome**: a proxy pyramid keeps 200-megapixel files smooth to pan and zoom, with on-demand full-resolution tiles the moment you zoom in past the proxy.
 - **Wide format support**: JPEG, PNG, WebP, GIF, AVIF, BMP, TIFF, HEIC/HEIF, and camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF and more).
@@ -60,7 +64,7 @@ FUSE error? `sudo apt install libfuse2`.
 
 1. **Import a folder** — it appears in the sidebar and stays in sync with disk.
 2. Click a photo to open the viewer.
-3. **Crop**: press `Enter` or click Crop, hit **Auto level**, adjust the frame, `Enter` to apply.
+3. **Crop**: press `Enter` or click Crop, pick an aspect or drag the frame, `Enter` to apply.
 4. **Develop**: adjust sliders in the right-hand panel — changes are live and non-destructive. Double-click any slider to reset it to 0.
 5. **Retouch**: press `S` for the Clone Stamp, drag to paint over what you want gone.
 6. **Export**: set a target size in MB and watch the live estimate, or use a saved preset for one click.
@@ -77,9 +81,10 @@ FUSE error? `sudo apt install libfuse2`.
 | Key | Action |
 |---|---|
 | `Enter` | Apply current edits (crop + develop + clone stamp) |
-| `Esc` | Apply & return to library |
+| `Esc` | Apply & return to library — or clear the library's photo selection, if one is active |
 | `←` `→` | Previous / next photo |
-| `[` `]` | Rotate crop frame 90° (in Crop) |
+| `[` `]` | Rotate 90° — works in the viewer and in Crop |
+| `\` (hold) | Compare with the original |
 | `S` | Open the Clone Stamp tool |
 | `[` `]`, `+` `-` | Shrink / grow the clone stamp brush (while the tool is open) |
 | Double-click a stroke | Delete that clone stamp stroke |
@@ -89,9 +94,11 @@ FUSE error? `sudo apt install libfuse2`.
 | `1`–`5`, `0` | Rate photo / clear rating |
 | `Ctrl+Click`, `Shift+Click` | Select photos / select a range (library) |
 
+All of the above work by physical key position, so they land in the same place on a Cyrillic (or any other) keyboard layout, not just US English.
+
 ### Good to know
 
-- Removing photos or folders from the library **never deletes files from disk** — there's an Undo in the toast either way.
+- Removing a folder from the library **never deletes files from disk** — there's an Undo in the toast either way.
 - A deep-zoomed view sharpens to true 1:1 pixels a moment after you stop zooming — that's the full-resolution tile catching up with the proxy.
 - If export says *"Maximum quality reached"*, your size limit is generous enough that quality 100 already fits under it.
 
@@ -109,4 +116,4 @@ npm start          # build & run
 npm run dist       # create the installer for your OS in release/
 ```
 
-Tech: Electron + React + Vite; sharp/libvips with MozJPEG for encoding; dcraw (in a worker thread) for RAW development; Hough-transform horizon detection.
+Tech: Electron + React + Vite; sharp/libvips with MozJPEG for encoding; dcraw (in a worker thread) for RAW development.

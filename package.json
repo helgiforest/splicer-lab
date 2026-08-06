@@ -1,8 +1,8 @@
 {
   "name": "splicer-lab",
   "productName": "Splicer Lab",
-  "version": "3.0.0",
-  "description": "A fast, fully local photo editor: library, non-destructive develop tools, precision crop with auto horizon leveling, clone stamp retouching, and size-targeted export.",
+  "version": "3.1.0",
+  "description": "A fast, fully local photo editor: library, non-destructive develop tools, precision crop, clone stamp retouching, and size-targeted export.",
   "main": "electron/main.cjs",
   "private": true,
   "scripts": {
