@@ -6,16 +6,6 @@
 
 ---
 
-## Philosophy
-
-Splicer Lab does a few things and does them properly, instead of trying to be everything. A real photo library, a proper develop module (exposure, color, highlights & shadows, with a live crop-aware histogram), a precision crop, a clone stamp for retouching, and export that hits an exact file size — that's the whole app. No accounts, no cloud processing, no telemetry: everything runs 100% locally, and your photos never leave your computer.
-
-The name is literal: a **splicer** is the tool an editor used to physically cut and join film — deliberate, mechanical, no undo by default. A **lab** is where that film got developed — a technical workroom, not a showroom. That's the register the whole app is built in: an instrument, not a toy. The Clone Stamp is the clearest expression of it — a raw, honest 1:1 pixel copy like Photoshop's real tool, with **no automatic color correction pretending to be smarter than it is**. If a patch doesn't match, that's a signal to pick a better source, not something for the software to paper over. The same restraint shows up everywhere else: an icon-only toolbar instead of a wall of labeled buttons, a Before/After hold instead of a permanent split-screen, one accent color used exactly once per screen instead of everything shouting for attention at once.
-
-Visually, that's a near-black workroom (`#0B0C0F`) lit by a single warm, amber-gold accent (`#F3C34F`) — the color of a darkroom safelight, not a brand gradient. Thin, precise line icons (1.8px stroke, rounded caps, no fill) stand in for controls the way a lab's own instrument markings would. Quiet, dark, exact — the app gets out of the way of the photo.
-
----
-
 ## Features
 
 - **Photo library** that mirrors your real folders — import once and it stays in sync with disk, even while the app is closed. Filter by rating, an "Edited" view, or folder; multi-select for batch export or reset. Removing a folder from the library (right-click it in the sidebar) never touches the files on disk. Originals are **never modified**; every edit is non-destructive.
