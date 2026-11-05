@@ -304,10 +304,10 @@ export function inpaint(img, w, h, hole, seed = 1) {
                            the buffer bilinearly (a big hole is worked on a
                            downsampled crop — nearest-neighbor scaling made
                            visible blocks)
-   + synthetic GRAIN     — noise matched to the real grain right around the
-                           hole (per-channel strength, channel correlation,
-                           pixel-to-pixel correlation), only as much as the
-                           network's smoother fill is missing.
+   + the photo's DETAIL  — its grain and fine texture, copied from around
+                           the hole (textureFill below); synthetic grain
+                           matched to the ring (addMatchedGrain) only when
+                           there's too little photo around to copy from.
    The grain used to be PatchMatch's high frequencies; on a large hole
    that carried whole copied OBJECTS into the fill (a red-white barrier
    pasted over a removed vehicle), so it's measured, not copied, now.
@@ -324,6 +324,12 @@ export function inpaint(img, w, h, hole, seed = 1) {
 // the hole covers more than this fraction of the buffer — a FRACTION, not
 // pixels, so the proxy preview and the full-res export pick the same one
 const LAMA_HOLE_FRACTION = 0.002;
+// part of a network result's cache key (memory and disk) — bump when what
+// the network is shown changes (neuralFill's LAMA_CONTEXT 0.15 → 0.6;
+// e: the letterbox margin beyond a hole at the photo's edge is hole too)
+const NET_LOOK = { lama: "|c0.6e" };
+// part of a Remove stroke's cached OUTPUT key — bump when textureFill changes
+export const FILL_LOOK = "tt5";
 // mode: the user's opt-in choice — "off" (PatchMatch only), "fast" (MI-GAN
 // for every hole) or "max" (LaMa for big holes once downloaded); null =
 // never asked = off. Results are keyed per engine (`${key}|${engine}`), so
@@ -335,7 +341,7 @@ const NEURAL_RESULTS_MAX = 32, NEURAL_PENDING_MAX = 16;
 export function setNeuralEnabled(on) { neural.enabled = !!on; }
 export function setNeuralMode(mode, lamaReady) { neural.mode = mode; neural.lama = !!lamaReady; neural.version++; }
 /* what a Remove stroke's final look depends on besides its pixels */
-export function neuralState() { return `${neural.mode}|${neural.lama}`; }
+export function neuralState() { return `${neural.mode}|${neural.lama}${NET_LOOK.lama}`; }
 /* bumped whenever a network result lands (or the mode changes): a stroke
    still waiting for one may look different after it */
 export function neuralVersion() { return neural.version; }
@@ -498,6 +504,488 @@ function addMatchedGrain(buf, width, height, channels, holeKeys, base, key) {
   return out;
 }
 
+/* ---- texture transfer: the network's shape, the photo's own detail ----
+   The network (and PatchMatch on a downsampled crop) returns a SMOOTH fill:
+   LaMa works at 512² and is scaled back up, and neither model makes film
+   grain. Synthetic grain (addMatchedGrain) fixed the noise level but not
+   the look — real grain is clumpy and signal-dependent, and a soft kerb
+   edge stays soft under any noise. So the fill's detail is COPIED instead:
+     L = the fill (hole) + the photo (around it), low-passed at σ — what
+         the network got right; σ ≈ its blur scale, so L holds no
+         detail the network didn't really have
+     a guided PatchMatch (on a sparse 5×5 grid of L) finds, for the hole,
+     real places around it whose L-neighborhood looks the same; the most
+     common displacements win (plus each pixel's own match as a handicapped
+     fallback — near the frame's edge most common ones point off it), and
+     the hole is rebuilt band by band from the photo at those places:
+       below σ    — grain: always the photo's (Σw·H / √Σw², so mixing two
+                    spots keeps its strength)
+       σ … 2.5σ   — fine texture: the photo's, except on the network's
+                    own edges (a horizon, a kerb stay exactly where it put
+                    them) and where no displacement really matches
+       coarser    — the network's, except where both it and the photo are
+                    nearly flat there: then the photo's evenness (the
+                    network's colors drift in big blotches over a sky)
+     Copying whole pieces per displacement, not per-pixel matches: those
+     left seams ("worms") as soon as the detail had any size. The coarse
+     bands are never copied over strong texture — doing it pixel by pixel
+     made a patchwork of the ripples. Finally the fill's tone is matched to
+     the photo along the hole's edge and spread inward.
+   It also gives the stroke its edge automatically (the stroke's own
+   feather/opacity no longer apply to Remove): within `band` of the
+   footprint's edge, wherever the original pixels already agree with the
+   fill (background the brush overlapped), the fill fades out into them
+   (dithered by the caller, like the other modes' feather); where they
+   don't (the object's rim, its shadow), the fill stays at full strength
+   right up to the edge. */
+const TT_PAD_MIN = 40, TT_PAD_MAX = 256; // px of real photo around the hole to copy detail from
+const TT_ITERS = 5;                      // guided PatchMatch passes
+const TT_GRID = 2;                       // sparse patch: (2·TT_GRID+1)² samples, `step` apart
+const TT_SIGMA_STEPS = [1, 1.5, 2, 3, 4, 6];  // σ only goes up to TT_SIGMA_MAX; coarser steps can still be boosted
+const TT_SIGMA_MAX = 3;      // at 6 a sky got sea-colored swirls copied in (yacht removal)
+const TT_BOOST_FROM = 0.4, TT_BOOST_UNTIL = 0.9, TT_BOOST_MAX = 1.6; // washed-out bands above σ: boosted when under this share of the photo's energy, by at most ×
+const TT_DISPS = 12;                     // displacements the detail is copied along
+const OWN_PENALTY = 2;                   // log-cost handicap of a pixel's own match among them
+
+/* box radii whose 3 passes approximate a Gaussian of σ (Kovesi) */
+function boxRadii(sigma) {
+  const n = 3, wIdeal = Math.sqrt((12 * sigma * sigma) / n + 1);
+  let wl = Math.floor(wIdeal); if (wl % 2 === 0) wl--;
+  const m = Math.round((12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4));
+  return [0, 1, 2].map((i) => ((i < m ? wl : wl + 2) - 1) >> 1);
+}
+function boxPass(src, dst, len, count, stride, step, r) {
+  // `count` lines of `len` samples; sample k of line j at j·stride + k·step
+  const inv = 1 / (2 * r + 1);
+  for (let j = 0; j < count; j++) {
+    const o = j * stride;
+    let acc = 0;
+    for (let i = -r; i <= r; i++) acc += src[o + Math.min(len - 1, Math.max(0, i)) * step];
+    for (let k = 0; k < len; k++) {
+      dst[o + k * step] = acc * inv;
+      acc += src[o + Math.min(len - 1, k + r + 1) * step] - src[o + Math.max(0, k - r) * step];
+    }
+  }
+}
+function gaussBlur(plane, w, h, sigma) {
+  let a = Float32Array.from(plane), b = new Float32Array(plane.length);
+  for (const r of boxRadii(sigma)) {
+    if (r < 1) continue;
+    boxPass(a, b, w, h, w, 1, r); boxPass(b, a, h, w, 1, w, r);
+  }
+  return a;
+}
+/* chamfer (3-4) distance, in px, of every cell to the nearest cell where
+   `isSeed` — two raster passes */
+function chamfer(w, h, isSeed) {
+  const d = new Float32Array(w * h);
+  for (let i = 0; i < d.length; i++) d[i] = isSeed(i) ? 0 : 1e9;
+  const A = 1, B = Math.SQRT2;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = y * w + x; let v = d[i];
+    if (x > 0) v = Math.min(v, d[i - 1] + A);
+    if (y > 0) { v = Math.min(v, d[i - w] + A); if (x > 0) v = Math.min(v, d[i - w - 1] + B); if (x < w - 1) v = Math.min(v, d[i - w + 1] + B); }
+    d[i] = v;
+  }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+    const i = y * w + x; let v = d[i];
+    if (x < w - 1) v = Math.min(v, d[i + 1] + A);
+    if (y < h - 1) { v = Math.min(v, d[i + w] + A); if (x < w - 1) v = Math.min(v, d[i + w + 1] + B); if (x > 0) v = Math.min(v, d[i + w - 1] + B); }
+    d[i] = v;
+  }
+  return d;
+}
+
+/* returns { rgb: Float32Array n·3, alpha: Float32Array n } for holeKeys'
+   order, or null when there's too little real photo around to copy from */
+function textureFill(buf, width, height, channels, holeKeys, base, key, sigma, band, transfer = true) {
+  const n = holeKeys.length;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const k of holeKeys) { const x = k % width, y = (k - x) / width; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  // the box is sized for the largest σ it may come to (TT_SIGMA_MAX)
+  const Rmax = TT_GRID * Math.round(TT_SIGMA_MAX * 0.75);
+  const pad = Math.min(TT_PAD_MAX, Math.max(TT_PAD_MIN, Math.round(Math.sqrt(n)))) + Rmax + Math.ceil(3 * TT_SIGMA_MAX);
+  // the box always reaches `pad` past the hole, also beyond the photo's
+  // edge (a hole cut by the frame): every patch offset stays inside it —
+  // flat indices that ran off one side used to wrap onto the other, and
+  // water got copied into the sky. Out there it's the edge pixel repeated,
+  // never a source and never "original" for the automatic edge.
+  const bx0 = x0 - pad, by0 = y0 - pad, bw = x1 - x0 + 1 + 2 * pad, bh = y1 - y0 + 1 + 2 * pad;
+  const N = bw * bh;
+  const hole = new Int32Array(N).fill(-1), outside = new Uint8Array(N);
+  holeKeys.forEach((k, i) => { const x = k % width, y = (k - x) / width; hole[(y - by0) * bw + x - bx0] = i; });
+  // I: fill inside, photo outside; P: the photo everywhere
+  const I = [0, 1, 2].map(() => new Float32Array(N)), P = [0, 1, 2].map(() => new Float32Array(N));
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+    const gx = Math.min(width - 1, Math.max(0, x + bx0)), gy = Math.min(height - 1, Math.max(0, y + by0));
+    const i = y * bw + x, o = (gy * width + gx) * channels, hi = hole[(gy - by0) * bw + gx - bx0];
+    if (gx !== x + bx0 || gy !== y + by0) outside[i] = 1;
+    for (let c = 0; c < 3; c++) { P[c][i] = buf[o + c]; I[c][i] = hi >= 0 ? base[hi * 3 + c] : buf[o + c]; }
+  }
+  // σ MEASURED, not guessed from the crop geometry: the scale up to which
+  // the fill is missing the photo's detail. Band by band (between two
+  // successive blurs of the luminance), the fill's energy deep inside the
+  // hole against the photo's around it; σ = the coarsest band of an
+  // unbroken run, from the finest up, where the fill has under half of
+  // it. A network that drew brick crisply keeps its brick (σ ≈ 1: only
+  // grain is copied); a soft LaMa over a wide hole gets more replaced.
+  const boosts = [];
+  if (transfer) {
+    const lum = new Float32Array(N);
+    for (let i = 0; i < N; i++) lum[i] = (I[0][i] + I[1][i] + I[2][i]) / 3;
+    const dDeep = chamfer(bw, bh, (i) => hole[i] < 0);
+    const dOut0 = chamfer(bw, bh, (i) => hole[i] >= 0 || outside[i]);
+    let prevB = lum, found = 1, run = true, prevSc = 0;
+    for (const sc of TT_SIGMA_STEPS) {
+      const B = gaussBlur(lum, bw, bh, sc);
+      let eh = 0, nh = 0, ep = 0, np = 0;
+      for (let i = 0; i < N; i += 2) {
+        const v = prevB[i] - B[i];
+        if (hole[i] >= 0) { if (dDeep[i] > 2 * sc + 1) { eh += v * v; nh++; } }
+        else if (!outside[i] && dOut0[i] > 2 * sc + 1) { ep += v * v; np++; }
+      }
+      prevB = B;
+      if (nh < 50 || np < 200) break;
+      const ratio = eh / nh / (ep / np);
+      if (run && ratio < 0.5 && sc <= TT_SIGMA_MAX) found = sc;
+      else {
+        run = false;
+        // a band the network drew, but washed out (water ripples at half
+        // their contrast): boosted back toward the photo's, never past it
+        // (only a band the network really drew: one it all but flattened
+        // holds mostly leftovers — boosted, the removed yacht's hull came
+        // back as a ghost on the horizon)
+        if (ratio >= TT_BOOST_FROM && ratio < TT_BOOST_UNTIL) boosts.push({ lo: prevSc, hi: sc, g: Math.min(TT_BOOST_MAX, Math.sqrt(1 / ratio)) - 1 });
+      }
+      prevSc = sc;
+    }
+    sigma = Math.min(TT_SIGMA_MAX, found);
+  }
+  const step = Math.max(1, Math.round(sigma * 0.75)), R = TT_GRID * step;
+  const L = I.map((p) => gaussBlur(p, bw, bh, sigma));
+  // sources: real pixels whose whole sparse patch is real and inside the box
+  const dOut = chamfer(bw, bh, (i) => hole[i] >= 0);
+  const srcs = [];
+  const sT0 = Math.ceil(Math.min(8, sigma * 2.5) * 0.75) + 1; // the coarse band's patch reach (below)
+  const rim = Math.max(R, sT0) + 1;
+  for (let y = rim; y < bh - rim; y++) for (let x = rim; x < bw - rim; x++) if (!outside[y * bw + x] && dOut[y * bw + x] > R + 1) srcs.push(y * bw + x);
+  if (srcs.length < 256) return null;
+  const L0 = L[0], L1 = L[1], L2 = L[2];
+  // the photo's own detail level, for how close a match has to be
+  const hf = new Float32Array(Math.min(srcs.length, 20000));
+  for (let k = 0; k < hf.length; k++) {
+    const q = srcs[Math.floor((k * srcs.length) / hf.length)];
+    hf[k] = (P[0][q] - L0[q] + P[1][q] - L1[q] + P[2][q] - L2[q]) / 3;
+  }
+  const grain = Math.max(1, robustSigma(hf));
+  // the low-pass of grain σ_g at σ keeps ≈ σ_g/(2√π σ) of it per sample;
+  // a difference well above that is a real one
+  const lpNoise = grain / (3.5 * sigma) + 0.75;
+
+  // the edge: agreement of the original with the fill, on the low-pass of both
+  const alpha = new Float32Array(n).fill(1);
+  if (band > 0) {
+    const LP = P.map((p) => gaussBlur(p, bw, bh, sigma));
+    const dIn = chamfer(bw, bh, (i) => hole[i] < 0 && !outside[i]);
+    const agreeTol = 3 * lpNoise + 2.5;
+    for (let p = 0; p < N; p++) {
+      const i = hole[p];
+      if (i < 0) continue;
+      const e = dIn[p] - 0.5;
+      if (e >= band) continue;
+      const g = e <= 0 ? 0 : (e / band) * (e / band) * (3 - 2 * (e / band));
+      const diff = (Math.abs(LP[0][p] - L0[p]) + Math.abs(LP[1][p] - L1[p]) + Math.abs(LP[2][p] - L2[p])) / 3;
+      alpha[i] = 1 - (1 - g) * Math.exp(-((diff / agreeTol) ** 2));
+    }
+  }
+  if (!transfer) return { rgb: base, alpha };
+
+  const offs = [];
+  for (let j = -TT_GRID; j <= TT_GRID; j++) for (let i = -TT_GRID; i <= TT_GRID; i++) offs.push(j * step * bw + i * step);
+  const K = offs.length;
+  const dist = (p, q, cap) => {
+    let d = 0;
+    for (let k = 0; k < K; k++) {
+      const a = p + offs[k], b = q + offs[k];
+      const e0 = L0[a] - L0[b], e1 = L1[a] - L1[b], e2 = L2[a] - L2[b];
+      d += e0 * e0 + e1 * e1 + e2 * e2;
+      if (d >= cap) return d;
+    }
+    return d;
+  };
+  // the same comparison on every other grid sample (3×3 of the 5×5): the
+  // per-pixel choice below is smoothed over a few px anyway
+  const lite = offs.filter((_, k) => (k % (2 * TT_GRID + 1)) % 2 === 0 && Math.floor(k / (2 * TT_GRID + 1)) % 2 === 0);
+  const distLite = (p, q) => {
+    let d = 0;
+    for (let k = 0; k < lite.length; k++) {
+      const a = p + lite[k], b = q + lite[k];
+      const e0 = L0[a] - L0[b], e1 = L1[a] - L1[b], e2 = L2[a] - L2[b];
+      d += e0 * e0 + e1 * e1 + e2 * e2;
+    }
+    return d * (K / lite.length);
+  };
+  // all hole pixels in scan order; the search itself only needs to find
+  // the common displacements, so it runs on every g-th of them per axis
+  const tgt = new Int32Array(n);
+  let t = 0;
+  for (let i = 0; i < N; i++) if (hole[i] >= 0) tgt[t++] = i;
+  const g = n > 20000 ? 3 : n > 4000 ? 2 : 1;
+  const grid = [];
+  for (let k = 0; k < n; k++) { const p = tgt[k], x = p % bw; if (x % g === 0 && ((p - x) / bw) % g === 0) grid.push(p); }
+  const m = grid.length;
+  const gOf = new Int32Array(N).fill(-1);
+  for (let k = 0; k < m; k++) gOf[grid[k]] = k;
+  const ok = new Uint8Array(N);
+  for (const q of srcs) ok[q] = 1;
+  const rand = rng(seedOf(key) ^ 0x5bd1e995);
+  const nnf = new Int32Array(m), nnd = new Float32Array(m);
+  for (let k = 0; k < m; k++) { nnf[k] = srcs[Math.floor(rand() * srcs.length)]; nnd[k] = dist(grid[k], nnf[k], Infinity); }
+  const maxR = Math.max(bw, bh);
+  const tryQ = (k, p, q) => {
+    if (q < 0 || q >= N || !ok[q]) return;
+    const d = dist(p, q, nnd[k]);
+    if (d < nnd[k]) { nnd[k] = d; nnf[k] = q; }
+  };
+  for (let it = 0; it < TT_ITERS; it++) {
+    const fwd = (it & 1) === 0, dir = fwd ? g : -g;
+    for (let kk = 0; kk < m; kk++) {
+      const k = fwd ? kk : m - 1 - kk, p = grid[k];
+      // propagation: the neighbor's match, shifted along (targets sit
+      // ≥ pad inside the box, so p ± g and p ± g·bw are always in it)
+      const nh = gOf[p - dir], nv = gOf[p - dir * bw];
+      if (nh >= 0) tryQ(k, p, nnf[nh] + dir);
+      if (nv >= 0) tryQ(k, p, nnf[nv] + dir * bw);
+      // random search around the current match, shrinking
+      const q0 = nnf[k], qx = q0 % bw, qy = (q0 - qx) / bw;
+      for (let r = maxR; r >= 1; r >>= 1) {
+        const x = qx + Math.round((rand() * 2 - 1) * r), y = qy + Math.round((rand() * 2 - 1) * r);
+        if (x >= 0 && y >= 0 && x < bw && y < bh) tryQ(k, p, y * bw + x);
+      }
+    }
+  }
+  // Copying each pixel from its own match leaves seams between the
+  // matched pieces — invisible in fine grain, ugly as soon as the detail
+  // has any size (worms). So the matches only VOTE for a few displacements
+  // (the most common ones), and the detail is copied whole from those:
+  // each pixel takes a soft, spatially smoothed choice among them by how
+  // well each one's low-pass matches here (a kerb gets the kerb's
+  // displacement, the asphalt beside it another), mixed so the grain keeps
+  // its strength where two overlap (Σw·H / √Σw², not Σw·H).
+  const votes = new Map();
+  for (let k = 0; k < m; k++) { const d = nnf[k] - grid[k]; votes.set(d, (votes.get(d) || 0) + 1); }
+  const ranked = [...votes.entries()].sort((u, v) => v[1] - u[1]);
+  const disp = [];
+  for (const [d] of ranked) {
+    if (disp.length >= TT_DISPS) break;
+    const dy = Math.round(d / bw), dx = d - dy * bw;
+    // near-duplicates copy the same grain twice
+    if (disp.some((e) => Math.abs(e.dx - dx) < 3 && Math.abs(e.dy - dy) < 3)) continue;
+    disp.push({ d, dx, dy });
+  }
+  const D = disp.length, BIG = 1e12;
+  // Two bands. The network's own texture is invented (and washed out by
+  // its 512² grid): ripples, cloud grain, cobbles. So away from edges the
+  // whole band below σT is replaced by the photo's — T = Lt + (photo − Lt)
+  // at the chosen displacement, Lt the network's fill blurred at σT. On
+  // EDGES of that coarse fill (a horizon, a kerb) copying a band that wide
+  // would drag the copied edge a few px off the network's — there only the
+  // fine band below σ is copied (F = L + (photo − L)), the edge stays the
+  // network's. Edge = gradient of Lt well above the photo's own texture.
+  const sT = Math.min(8, sigma * 2.5);
+  const Lt = I.map((pl) => gaussBlur(pl, bw, bh, sT));
+  const stepT = Math.max(1, Math.round(sT * 0.75));
+  const liteT = [];
+  for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) liteT.push(j * stepT * bw + i * stepT);
+  const distT = (p, q) => {
+    let d = 0;
+    for (let k = 0; k < liteT.length; k++) {
+      const a = p + liteT[k], b = q + liteT[k];
+      if (b < 0 || b >= N) return BIG;
+      const e0 = Lt[0][a] - Lt[0][b], e1 = Lt[1][a] - Lt[1][b], e2 = Lt[2][a] - Lt[2][b];
+      d += e0 * e0 + e1 * e1 + e2 * e2;
+    }
+    return d * (K / liteT.length);
+  };
+  // per displacement: patch distance (fine + coarse) at every hole pixel,
+  // box-smoothed over the hole so the choice changes gradually
+  const cost = disp.map(({ d }) => {
+    const c = new Float32Array(N).fill(BIG);
+    for (let k = 0; k < n; k++) { const p = tgt[k], q = p + d; if (q >= 0 && q < N && ok[q]) c[p] = distLite(p, q) + distT(p, q); }
+    return c;
+  });
+  const sm = Math.max(2, Math.round(sigma * 1.5));
+  for (const c of cost) {
+    const tmp = new Float32Array(N);
+    // log-domain smoothing: one invalid neighbor must not poison a pixel
+    for (let i = 0; i < N; i++) c[i] = Math.log1p(c[i]);
+    boxPass(c, tmp, bw, bh, bw, 1, sm); boxPass(tmp, c, bh, bw, 1, bw, sm);
+  }
+  // smoothed log-cost: a ratio of e^0.6 ≈ 1.8 between two displacements → weight 1 : 0.37
+  const temp = 0.6;
+  // Bands: L (σ) ⊃ Lt (σT) ⊃ Lm ⊃ Lc, all low-passes of the filled image.
+  // The output is the network's coarsest one plus every finer band, each
+  // either COPIED from the chosen photo spots or kept from the network:
+  // the network's where it has an edge at that scale (a horizon, a kerb —
+  // its structure), the network's too where the spot copied from has an
+  // edge at that scale (a horizon must not be copied into the sky), the
+  // photo's everywhere else — the network's invented mid-scale blotches
+  // and soft ripples replaced by the real thing.
+  const LB = [L, Lt, ...[6, 15, 35].map((f) => I.map((pl) => gaussBlur(pl, bw, bh, sigma * f)))];
+  const NB = LB.length;
+  const gradAt = (A, p) => {
+    let gsum = 0;
+    for (let c = 0; c < 3; c++) gsum += Math.abs(A[c][p + 1] - A[c][p - 1]) + Math.abs(A[c][p + bw] - A[c][p - bw]);
+    return gsum / 6;
+  };
+  // each band's typical (texture) gradient, over the photo around the hole
+  const gMed = LB.map((A) => {
+    const gs = new Float32Array(Math.min(srcs.length, 20000));
+    for (let k = 0; k < gs.length; k++) gs[k] = gradAt(A, srcs[Math.floor((k * srcs.length) / gs.length)]);
+    return Math.max(0.05, kthSmallest(gs, gs.length >> 1));
+  });
+  const edgeOf = (b, p) => { const r = gradAt(LB[b], p) / gMed[b]; return r <= 2.5 ? 0 : r >= 5 ? 1 : ((r - 2.5) / 2.5) ** 2 * (3 - 2 * ((r - 2.5) / 2.5)); };
+  // Detail energy around every source (box-smoothed |photo − Lt|²): a
+  // spot far busier than what's typical around the hole (a window grille
+  // next to plain brick) matches at the low-pass yet would paste its
+  // lines in as "texture" — such candidates are handicapped by how much
+  // busier they are.
+  const Eh = new Float32Array(N), tmpEh = new Float32Array(N);
+  for (let i = 0; i < N; i++) { let e = 0; for (let c = 0; c < 3; c++) { const v = P[c][i] - Lt[c][i]; e += v * v; } Eh[i] = e / 3; }
+  const er = Math.max(2, Math.round(sT));
+  boxPass(Eh, tmpEh, bw, bh, bw, 1, er); boxPass(tmpEh, Eh, bh, bw, 1, bw, er);
+  const es = new Float32Array(Math.min(srcs.length, 20000));
+  for (let k = 0; k < es.length; k++) es[k] = Eh[srcs[Math.floor((k * srcs.length) / es.length)]];
+  const eMax = 2.5 * Math.max(1, kthSmallest(es, es.length >> 1));
+  const busy = (q) => (Eh[q] > eMax ? 1.5 * Math.log(Eh[q] / eMax) : 0);
+  // what a real match may cost: both patches' low-pass noise, with a wide
+  // margin — textures like water never match closely, and only a plainly
+  // wrong match (sea for sky) should lose its coarse band
+  const tolLog = Math.log1p(8 * K * 3 * (3 * lpNoise) ** 2);
+  const rgb = new Float32Array(n * 3), w = new Float32Array(D + 1), dd = new Int32Array(D + 1), c0 = new Float64Array(D + 1);
+  for (let k = 0; k < n; k++) {
+    const p = tgt[k], i = hole[p];
+    // candidates: the common displacements, plus this spot's own match
+    // (the nearest search sample's) — near the photo's edge most common
+    // ones point off it, and the few left may be the wrong thing entirely
+    // (sea under sky); its own match is at least the right kind
+    const x = p % bw, y = (p - x) / bw, gk = gOf[(y - (y % g)) * bw + x - (x % g)];
+    let best = Infinity;
+    for (let j = 0; j <= D; j++) {
+      dd[j] = j < D ? disp[j].d : gk >= 0 ? nnf[gk] - grid[gk] : 0;
+      const q = p + dd[j];
+      if (j === D && gk < 0) { c0[j] = Infinity; continue; }
+      // (its own match: unsmoothed, so it's held back by OWN_PENALTY — a
+      // fallback, not a rival; on its own it patchworks the fill)
+      c0[j] = q >= 0 && q < N && ok[q] ? (j < D ? cost[j][p] : Math.log1p(distLite(p, q) + distT(p, q)) + OWN_PENALTY) + busy(q) : Infinity;
+      if (c0[j] < best) best = c0[j];
+    }
+    if (best === Infinity) { for (let c = 0; c < 3; c++) rgb[i * 3 + c] = L[c][p]; continue; }
+    let sw = 0, sw2 = 0;
+    for (let j = 0; j <= D; j++) { w[j] = c0[j] === Infinity ? 0 : Math.exp(-(c0[j] - best) / temp); sw += w[j]; }
+    for (let j = 0; j <= D; j++) { w[j] /= sw; sw2 += w[j] * w[j]; }
+    const norm = 1 / Math.sqrt(sw2);
+    // no candidate really matches: copy only the grain
+    const eBad = best <= tolLog ? 0 : Math.min(1, (best - tolLog) / 2);
+    // per band (1…NB−1): keep the network's — where it has an edge there,
+    // or (coarse bands) where the spot copied from has one
+    const keep = new Float32Array(NB);
+    keep[1] = Math.max(edgeOf(1, p), eBad);
+    for (let b = 2; b < NB; b++) {
+      let es = 0;
+      for (let j = 0; j <= D; j++) if (w[j] > 1e-3) es += w[j] * edgeOf(b, p + dd[j]);
+      keep[b] = Math.max(edgeOf(b, p), es, eBad);
+    }
+    // The coarse bands: copied only where the photo is FLAT at that scale
+    // (a sky, a wall) — the network's drifting blotches there are replaced
+    // by the photo's evenness. Where the photo has texture that coarse
+    // (ripples, waves) the network's own is kept: copying it from
+    // different spots pixel by pixel left a patchwork of seams.
+    let jb = 0;
+    for (let j = 1; j <= D; j++) if (w[j] > w[jb]) jb = j;
+    const qb = p + dd[jb];
+    const flat = new Float32Array(NB);
+    for (let b = 2; b < NB; b++) {
+      // …and only where the network's own band there is faint (drift):
+      // a strong one is texture it drew on purpose (ripples)
+      let m = 0, mf = 0;
+      for (let c = 0; c < 3; c++) { m += Math.abs(LB[b - 1][c][qb] - LB[b][c][qb]); mf += Math.abs(LB[b - 1][c][p] - LB[b][c][p]); }
+      m /= 3; mf /= 3;
+      flat[b] = (1 - keep[b]) * (m <= 1.5 ? 1 : m >= 4 ? 0 : (4 - m) / 2.5) * (mf <= 3 ? 1 : mf >= 6 ? 0 : (6 - mf) / 3);
+    }
+    for (let c = 0; c < 3; c++) {
+      let v = LB[NB - 1][c][p], h0 = 0, h1 = 0;
+      for (let j = 0; j <= D; j++) {
+        if (w[j] <= 1e-3) continue;
+        const q = p + dd[j];
+        h0 += w[j] * (P[c][q] - L[c][q]);
+        h1 += w[j] * (LB[0][c][q] - LB[1][c][q]);
+      }
+      // the grain-like bands mixed variance-preserving (see above)
+      v += h0 * norm + keep[1] * (LB[0][c][p] - LB[1][c][p]) + (1 - keep[1]) * h1 * norm;
+      for (let b = 2; b < NB; b++) v += (1 - flat[b]) * (LB[b - 1][c][p] - LB[b][c][p]) + flat[b] * (LB[b - 1][c][qb] - LB[b][c][qb]);
+      rgb[i * 3 + c] = v;
+    }
+  }
+  // the boosts (see σ above), on the network's own bands — not on its
+  // edges, where it would only sharpen into halos
+  for (const bst of boosts) {
+    if (bst.lo < sigma) continue;
+    const lo = bst.lo === sigma ? L : I.map((pl) => gaussBlur(pl, bw, bh, bst.lo));
+    const hi = I.map((pl) => gaussBlur(pl, bw, bh, bst.hi));
+    for (let k = 0; k < n; k++) {
+      const p = tgt[k], i = hole[p], wgt = bst.g * (1 - edgeOf(1, p));
+      if (wgt <= 0) continue;
+      for (let c = 0; c < 3; c++) rgb[i * 3 + c] += wgt * (lo[c][p] - hi[c][p]);
+    }
+  }
+  // Tone: the network's colors drift a little at large scale (a lilac
+  // patch in a blue sky) — invisible as texture, obvious as a blotch. The
+  // difference between the photo's and the fill's local means along the
+  // hole's edge is spread into the hole (inverse-distance), so the fill
+  // meets its surroundings in tone everywhere. Edge samples that differ a
+  // lot are left out: that's the removed object's rim, not drift.
+  const sB = Math.max(6, sT * 2);
+  const realM = new Float32Array(N), fillM = new Float32Array(N);
+  for (let i = 0; i < N; i++) { realM[i] = hole[i] < 0 && !outside[i] ? 1 : 0; fillM[i] = hole[i] >= 0 ? 1 : 0; }
+  const nRealW = gaussBlur(realM, bw, bh, sB), nFillW = gaussBlur(fillM, bw, bh, sB);
+  const realC = [0, 1, 2].map((c) => { const a = new Float32Array(N); for (let i = 0; i < N; i++) a[i] = realM[i] * P[c][i]; return gaussBlur(a, bw, bh, sB); });
+  const fillC = [0, 1, 2].map((c) => { const a = new Float32Array(N); for (let i = 0; i < N; i++) if (hole[i] >= 0) a[i] = rgb[hole[i] * 3 + c]; return gaussBlur(a, bw, bh, sB); });
+  const edgeD = chamfer(bw, bh, (i) => hole[i] < 0 && !outside[i]);
+  const samp = [];
+  for (let k = 0; k < n; k++) {
+    const p = tgt[k];
+    if (edgeD[p] > 2 || nRealW[p] < 0.15 || nFillW[p] < 0.15) continue;
+    samp.push([p % bw, Math.floor(p / bw), ...[0, 1, 2].map((c) => realC[c][p] / nRealW[p] - fillC[c][p] / nFillW[p])]);
+  }
+  if (samp.length >= 8) {
+    const mag = new Float32Array(samp.length);
+    samp.forEach((t, j) => { mag[j] = (Math.abs(t[2]) + Math.abs(t[3]) + Math.abs(t[4])) / 3; });
+    const med = kthSmallest(Float32Array.from(mag), mag.length >> 1);
+    const keep = samp.filter((_, j) => mag[j] <= 3 * med + 4);
+    const stride = Math.max(1, Math.ceil(keep.length / 300));
+    const use = keep.filter((_, j) => j % stride === 0);
+    for (let k = 0; k < n && use.length; k++) {
+      const p = tgt[k], x = p % bw, y = (p - x) / bw, i = hole[p];
+      let sw = 0, d0 = 0, d1 = 0, d2 = 0;
+      for (const t of use) {
+        const dx = t[0] - x, dy = t[1] - y, wgt = 1 / (dx * dx + dy * dy + 1) ** 1.5;
+        sw += wgt; d0 += wgt * t[2]; d1 += wgt * t[3]; d2 += wgt * t[4];
+      }
+      rgb[i * 3] += d0 / sw; rgb[i * 3 + 1] += d1 / sw; rgb[i * 3 + 2] += d2 / sw;
+    }
+  }
+  return { rgb, alpha };
+}
+
+/* the network's blur scale, in buffer px: how many buffer pixels one of
+   its 512² cells covers (LaMa and MI-GAN both work at 512) */
+function netSigma(holeW, holeH, w, h, s) {
+  const side = Math.min(Math.max(w, h), Math.round(Math.max(holeW, holeH) * s * 1.3) + 32);
+  const perCell = Math.max(side, 1) / 512 / s;
+  return Math.min(4, Math.max(1.5, 1.1 * perCell));
+}
+
 /* ---- the stamp-tool entry point, with a small result cache ---- */
 const cache = new Map(); // key → { w, h, pm: crop (PatchMatch), input, hole, nnOut?: final colors with the neural fill }
 const CACHE_MAX = 32;
@@ -514,8 +1002,10 @@ export function hashRegion(buf, width, channels, x0, y0, x1, y1) {
   return h >>> 0;
 }
 
-/* `holeKeys`: buffer pixel indices (y·width + x) to fill. Returns
-   Map(key → [r, g, b]). Reads `buf` only. */
+/* `holeKeys`: buffer pixel indices (y·width + x) to fill; `band`: px from
+   the footprint's edge where the fill may fade into matching original
+   pixels (textureFill). Returns Map(key → [r, g, b, alpha]). Reads `buf`
+   only. */
 /* ---- PatchMatch in the background ----
    PatchMatch takes up to ~2 s on a big stroke (M-series; slower PCs
    several times that), so the on-screen composite doesn't run it inline:
@@ -572,7 +1062,7 @@ function makeEntry(key, w, h, pm, hole) {
   return entry;
 }
 
-export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
+export function removeFill(buf, width, height, channels, holeKeys, strokeKey, band = 0) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const key of holeKeys) {
     const x = key % width, y = (key - x) / width;
@@ -611,7 +1101,7 @@ export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
   }
 
   const engine = engineFor(holeKeys.length, width * height);
-  const nkey = engine && `${key}|${engine}`;
+  const nkey = engine && `${key}|${engine}${NET_LOOK[engine] || ""}`;
   const nn = engine ? neural.results.get(nkey) : null;
   if (engine && !nn && neural.enabled && !neural.inflight.has(nkey) && !neural.pending.has(nkey) && !neural.failed.has(nkey)) {
     neural.pending.set(nkey, { key: nkey, w, h, rgb: entry.input, hole: entry.hole, engine });
@@ -627,15 +1117,31 @@ export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
     sampleBilinear(src, w, h, (x - cx0 + 0.5) * s - 0.5, (y - cy0 + 0.5) * s - 0.5, px);
     base[idx * 3] = px[0]; base[idx * 3 + 1] = px[1]; base[idx * 3 + 2] = px[2];
   });
-  if (nn && !entry.nnOut[engine]) entry.nnOut[engine] = addMatchedGrain(buf, width, height, channels, holeKeys, base, key);
-  const final = nn ? entry.nnOut[engine] : base;
+  // final = nothing better is coming for this exact input (no network
+  // result still to land) — only then may the caller cache what it drew
+  const isFinal = !engine || !!nn;
+  const tag = `${nn ? engine : "pm"}|${band}`;
+  let done = isFinal ? entry.nnOut[tag] : null;
+  if (isFinal && !done) {
+    // detail is missing wherever the base came through a resampling: the
+    // network's 512² grid, or PatchMatch's downsampled crop (at full scale
+    // PatchMatch copies real pixels and already has it)
+    const sigma = nn ? netSigma(x1 - x0 + 1, y1 - y0 + 1, w, h, s) : s < 0.9 ? Math.min(4, Math.max(1.5, 1.1 / s)) : 0;
+    done = textureFill(buf, width, height, channels, holeKeys, base, key, sigma || 1.5, band, !!sigma)
+      // too little photo around to copy from: the old matched noise
+      || { rgb: nn ? addMatchedGrain(buf, width, height, channels, holeKeys, base, key) : base, alpha: null };
+    entry.nnOut[tag] = done;
+  }
+  const final = done ? done.rgb : base, alpha = done ? done.alpha : null;
 
   const out = new Map();
   holeKeys.forEach((k, idx) => {
-    out.set(k, [Math.round(final[idx * 3]), Math.round(final[idx * 3 + 1]), Math.round(final[idx * 3 + 2])]);
+    // clamped: added grain/detail can overshoot 0..255, and a Node Buffer
+    // (export) WRAPS instead of clamping — 256 became 0 in one channel,
+    // cyan/magenta specks over bright brick
+    const v = (c) => { const x = Math.round(final[idx * 3 + c]); return x < 0 ? 0 : x > 255 ? 255 : x; };
+    out.set(k, [v(0), v(1), v(2), alpha ? alpha[idx] : 1]);
   });
-  // final = nothing better is coming for this exact input (no network
-  // result still to land) — only then may the caller cache what it drew
-  out.final = !engine || !!nn;
+  out.final = isFinal;
   return out;
 }

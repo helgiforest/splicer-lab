@@ -5,7 +5,7 @@ import {
   applyAdjustToRGBBuffer, DEHAZE_T_MIN, DEHAZE_OMEGA,
 } from "../electron/colorAdjust.mjs";
 import { autoStraightenAngle } from "../electron/autoStraighten.mjs";
-import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp, findHealSource, setStrokeCacheSink, packStrokeEntry, restoreStrokeCache } from "../electron/stampTool.mjs";
+import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp, findHealSource, setStrokeCacheSink, packStrokeEntry, restoreStrokeCache, stampPending } from "../electron/stampTool.mjs";
 import { setNeuralEnabled, setNeuralMode, takeNeuralJobs, putNeuralResult, setAsyncFill, fillDeferred, takeFillJobs, putFillResult, fillsInProgress, inpaint } from "../electron/removeTool.mjs";
 import {
   isEmptyRedEye, normalizeRedEye, detectRedEye, applyRedEyeToRGBBuffer, mapRedEye,
@@ -807,14 +807,6 @@ button.hud-chip:hover { background: var(--glass-hover); }
 .hf-head .val em { font-style: normal; font-weight: 500; font-size: 10.5px; color: var(--muted); margin-left: 1px; }
 .hf-head .val.zero { color: var(--faint); }
 .hfield .track { height: 20px; }
-.selchip {
-  display: flex; align-items: center; gap: 2px; height: 32px; padding: 0 3px 0 10px; border-radius: 9px;
-  background: var(--accent-soft); color: var(--accent-text); font-size: 12px; font-weight: 600; white-space: nowrap;
-  margin-left: 4px; flex-shrink: 0;
-}
-.selchip .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 5px; }
-.selchip .ib { color: var(--accent-text); }
-.selchip .ib:hover { background: var(--accent-soft); }
 .hud-seg { display: flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--well); flex-shrink: 0; }
 .hud-seg button {
   height: 32px; padding: 0 10px; border-radius: 7px; border: 0; background: none; font-size: 12px; font-weight: 600; color: var(--muted);
@@ -840,6 +832,9 @@ button.hud-chip:hover { background: var(--glass-hover); }
 .hud-done:hover { filter: brightness(1.07); }
 .hud-done:active { transform: translateY(.5px); }
 .hud-done .kbd { color: rgba(36,26,3,.7); background: rgba(36,26,3,.1); border-color: rgba(36,26,3,.16); }
+.edge-auto { display: flex; flex-direction: column; justify-content: center; gap: 4px; padding: 0 10px; flex-shrink: 0; line-height: 1; white-space: nowrap; }
+.edge-auto b { font-size: 13px; font-weight: 650; color: var(--text); }
+.edge-auto span { font-size: 10.5px; font-weight: 600; color: var(--muted); }
 .ai-field { display: flex; align-items: center; gap: 10px; padding: 0 6px 0 8px; flex-shrink: 0; }
 .ai-lab { display: flex; flex-direction: column; gap: 4px; }
 .ai-name { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 650; line-height: 1; color: var(--text); white-space: nowrap; }
@@ -865,11 +860,11 @@ button.hud-chip:hover { background: var(--glass-hover); }
 .ai-foot { margin-top: 10px; font-size: 11px; color: var(--faint); }
 /* narrow canvas: drop what the HUD can live without, labels first */
 @container (max-width: 1000px) {
-  .hud .brush-prev, .hud .selchip-text, .hud-chip .chip-text, .ai-sub { display: none; }
+  .hud .brush-prev, .hud-chip .chip-text, .ai-sub { display: none; }
   .hud .hfield { min-width: 84px; padding: 3px 7px 0; }
 }
 @container (max-width: 760px) {
-  .hud-done .kbd, .hud .selchip { display: none; }
+  .hud-done .kbd { display: none; }
   .ai-name { font-size: 0; gap: 0; }
   .ai-field { gap: 6px; padding: 0 2px 0 6px; }
   .hud .hsep { margin: 0 2px; }
@@ -2156,6 +2151,43 @@ if (NATIVE) {
   });
 }
 
+/* Composites left unfinished: a photo switched away from (or the editor
+   closed) while some of its Remove strokes were still filling. Their fills
+   keep running and land on disk (pm|/nn|), but a stroke's FINAL output
+   (st|, what restoreStrokeCache replays on the next open) is only stored by
+   a composite that sees its result land — so an unfinished one is handed
+   over here and recomposited off-screen as results land, until nothing is
+   pending. Without this, reopening such a photo showed "Filling…" and
+   rebuilt it stroke by stroke. */
+const orphanComposites = new Map(); // src → { data, width, height, stamp }
+const ORPHANS_MAX = 3;
+function adoptOrphan(o) {
+  orphanComposites.delete(o.src);
+  orphanComposites.set(o.src, o);
+  while (orphanComposites.size > ORPHANS_MAX) orphanComposites.delete(orphanComposites.keys().next().value);
+  redrawFills();
+}
+function finishOrphans() {
+  if (!orphanComposites.size) return;
+  for (const [src, o] of orphanComposites) {
+    setNeuralEnabled(NATIVE && !!window.meridian?.neuralInpaint);
+    setAsyncFill(true);
+    strokePersist = true;
+    applyStampToRGBBuffer(new Uint8ClampedArray(o.data), o.width, o.height, 4, o.stamp);
+    const pending = stampPending();
+    strokePersist = false;
+    setAsyncFill(false);
+    setNeuralEnabled(false);
+    if (!pending) orphanComposites.delete(src);
+  }
+  drainFillJobs();
+  drainNeuralJobs();
+  // nothing left running means nothing more will land (e.g. a network run
+  // that failed): what's stored is all there will be
+  if (!fillsInProgress()) orphanComposites.clear();
+}
+fillRedraws.add(finishOrphans);
+
 const SPARKLE = <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="spark"><path d="M12 2.5l1.9 5.6a3 3 0 0 0 1.9 1.9l5.6 1.9-5.6 1.9a3 3 0 0 0-1.9 1.9L12 21.5l-1.9-5.6a3 3 0 0 0-1.9-1.9L2.6 12l5.6-1.9a3 3 0 0 0 1.9-1.9z"/></svg>;
 
 /* AI for Remove: opt-in modes (main.cjs's "AI for Remove" section) */
@@ -2165,7 +2197,7 @@ const AI_MODES = [
   { key: "max", label: "Max", tip: "LaMa for big objects — best structure, slower" },
 ];
 
-function GLImage({ className, style, src, draggable, adjust, stamp, draft, redeye, texRegion, origDiag }) {
+function GLImage({ className, style, src, draggable, adjust, stamp, redeye, texRegion, origDiag }) {
   const canvasRef = useRef(null);
   const glRef = useRef(null);
   const texRef = useRef(null);
@@ -2184,8 +2216,6 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
   const guideRef = useRef(null);
   const compositeRef = useRef(null); // { version, data, width, height, scale }
   const guideTimerRef = useRef(0);
-  const draftRef = useRef(draft);
-  draftRef.current = draft;
   const texRegionRef = useRef(texRegion);
   texRegionRef.current = texRegion;
   const srcRef = useRef(src);
@@ -2194,6 +2224,7 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
   const uploadTokenRef = useRef(0);
   const uploadRafRef = useRef(0);
   const restoredRef = useRef(null); // { src, done }: the image whose strokes are restored from disk (restoreStrokeCache)
+  const unfinishedRef = useRef(null); // the last composite, while some stroke in it is still filling (see adoptOrphan)
 
   /* Guide planes for the latest composite (see GUIDE_RECOMPUTE_DELAY).
      Only ever runs when a guide-reading slider is actually in use — draw()
@@ -2404,22 +2435,11 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
     canvas.width = p.width;
     canvas.height = p.height;
     g.gl.bindTexture(g.gl.TEXTURE_2D, texRef.current);
-    // fold the in-progress draft stroke into the same list `stamp` itself
-    // will hold once the drag commits — an appended new stroke, or the
-    // relevant existing stroke's own points extended, exactly mirroring
-    // the two branches beginWindowDrag's onUp commits (see StampOverlay).
-    const d = draftRef.current;
-    let strokesForComposite = stampRef.current;
-    // a Remove stroke in progress is outline-only: its content-aware fill
-    // (electron/removeTool.mjs) runs once, when the stroke is committed —
-    // never per pointermove
-    const draftIsRemove = d && (d.isNew ? d.mode === "remove" : stampRef.current[d.index]?.mode === "remove");
-    if (d && d.points && d.points.length && !draftIsRemove) {
-      strokesForComposite = d.isNew
-        ? [...strokesForComposite, { points: d.points, radius: d.radius, dx: d.dx, dy: d.dy, feather: d.feather, opacity: d.opacity, mode: d.mode }]
-        : strokesForComposite.map((s, i) => (i === d.index ? { ...s, points: [...s.points, ...d.points] } : s));
-    }
-    const texStamp = mapStampToTexSpace(strokesForComposite, texRegionRef.current, p.width);
+    // only committed strokes: one being drawn shows as its outline only
+    // (StampOverlay) and takes effect when the drag ends — recompositing a
+    // full-size photo on every pointermove made drawing stutter (the user's
+    // call: see the outline while painting, the result on release)
+    const texStamp = mapStampToTexSpace(stampRef.current, texRegionRef.current, p.width);
     const texRedEye = mapRedEyeToTexSpace(redeyeRef.current, texRegionRef.current, p.width);
     // same order as every bake path: stamp/heal → red eye → (color, in the shader)
     // first composite of a newly decoded image: bring its finished strokes
@@ -2445,8 +2465,9 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
         // drainFillJobs / drainNeuralJobs
         setNeuralEnabled(NATIVE && !!window.meridian?.neuralInpaint);
         setAsyncFill(true);
-        strokePersist = !d;
+        strokePersist = true;
         applyStampToRGBBuffer(pixels, p.width, p.height, 4, texStamp);
+        unfinishedRef.current = stampPending() ? { src: p.src, data: p.data, width: p.width, height: p.height, stamp: texStamp } : null;
         strokePersist = false;
         setAsyncFill(false);
         setNeuralEnabled(false);
@@ -2508,17 +2529,19 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
       pristineRef.current = { src, width: c.width, height: c.height, data: ctx.getImageData(0, 0, c.width, c.height).data, img };
       scheduleUpload();
     }).catch(() => {});
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+      // leaving this image (another photo, or the editor closing) with
+      // strokes still filling: finish them off-screen so they're stored
+      const o = unfinishedRef.current;
+      unfinishedRef.current = null;
+      if (o && o.src === src) adoptOrphan(o);
+    };
   }, [src, scheduleUpload]);
 
-  /* Recomposite + reupload whenever the stamp strokes, the in-progress
-     draft stroke, or texRegion change. `draft` changes on every processed
-     pointermove during a drag (see StampOverlay's beginWindowDrag handler)
-     — scheduleUpload's own requestAnimationFrame coalescing (see its own
-     comment above) is what keeps that from recompositing/re-uploading
-     more than once per displayed frame, same as it already does for
-     rapid stamp commits. */
-  useEffect(() => { scheduleUpload(); }, [stamp, draft, redeye, texRegion, scheduleUpload]);
+  /* Recomposite + reupload whenever the committed stamp strokes, red eye
+     or texRegion change (never per pointermove of a stroke being drawn) */
+  useEffect(() => { scheduleUpload(); }, [stamp, redeye, texRegion, scheduleUpload]);
 
   /* redraw (GPU-cheap: uniform update + one quad) on every adjust change */
   useEffect(() => { scheduleDraw(); }, [adjust, scheduleDraw]);
@@ -2547,7 +2570,6 @@ const TOOL_ICON = {
   level: svgTool(<><rect x="2.5" y="8" width="19" height="8" rx="4"/><path d="M9.2 9.6v4.8M14.8 9.6v4.8"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></>),
   redeye: svgTool(<><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3" fill="currentColor"/></>),
   wb: svgTool(<><path d="M14.5 4.5l5 5"/><path d="M17 7l2.6-2.6a1.9 1.9 0 0 0-2.7-2.7L14.3 4.3"/><path d="M15.5 8.5L6 18l-3 1 1-3 9.5-9.5"/></>),
-  trash: svgTool(<><path d="M4 7h16"/><path d="M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/><path d="M6.5 7l.9 12a1.2 1.2 0 0 0 1.2 1.1h6.8a1.2 1.2 0 0 0 1.2-1.1l.9-12"/></>),
 };
 const outlineFor = (mode) => (mode === "heal" ? HEAL_OUTLINE : mode === "remove" ? REMOVE_OUTLINE : CLONE_OUTLINE);
 const STAMP_SOURCE_OFFSET_MULT = 2.5; // default source distance, as a multiple of radius
@@ -3562,34 +3584,12 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   // toned) or Remove (content-aware fill, no source) — session-local brush
   // setting like radius/feather; each stroke keeps its own mode
   const [stampMode, setStampMode] = useState("clone");
-  /* Clone/Heal/Remove picker (toolbar chips and H). Always sets the BRUSH — what
-     every following stroke will be — and, when a stroke is selected, that
-     stroke too. Not "selected stroke only": painting auto-selects the
-     stroke just made, so a selected-only rule meant picking Heal after
-     the first dab silently converted that one stroke and every later
-     stroke stayed Clone (found in real use: not a single heal stroke had
-     been saved). */
-  const pickStampMode = (next) => {
-    setStampMode(next);
-    if (selectedStroke == null || !stamp[selectedStroke]) return;
-    if ((stamp[selectedStroke].mode || "clone") === next) return;
-    const heal = next === "heal";
-    snapshot();
-    // switching TO Heal also replaces the hand-picked source with an
-    // automatic one (Heal has no user source); back to Clone keeps it, so
-    // it's then draggable from where Heal had put it
-    let auto = null;
-    const px = editPixelsRef.current;
-    if (heal && px) {
-      const st = stamp[selectedStroke], k = px.scale;
-      const obstacles = stamp.flatMap((s, i) => (i === selectedStroke ? [] : s.points.map((p) => ({ x: p.x * k, y: p.y * k, radius: s.radius * k }))));
-      const f = findHealSource(px.data, px.width, px.height, 4, st.points.map((p) => ({ x: p.x * k, y: p.y * k })), st.radius * k, st.feather, obstacles);
-      if (f) auto = { dx: f.dx / k, dy: f.dy / k };
-    }
-    // Remove has no source at all; Clone keeps whatever offset the stroke had
-    const noSource = next === "remove" ? { dx: 0, dy: 0, points: stamp[selectedStroke].points.map((p) => ({ x: p.x, y: p.y })) } : null;
-    setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, mode: next === "clone" ? undefined : next, ...auto, ...noSource } : s)));
-  };
+  /* Clone/Heal/Remove picker (tool rail, the HUD's mode chip, H): sets the
+     BRUSH only — what the following strokes will be. It never touches a
+     stroke already painted: it used to convert the selected one too, and
+     since painting auto-selects the stroke just made, picking Heal after
+     a Remove stroke silently turned that stroke into a Heal. */
+  const pickStampMode = (next) => setStampMode(next);
   // Size/Darken for the NEXT red-eye correction (a selected one is edited
   // directly instead — same split as the stamp's Feather/Opacity)
   const [newEyeSize, setNewEyeSize] = useState(REDEYE_DEFAULT_SIZE);
@@ -4591,6 +4591,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (mode === "crop" && rect && view) refit(rect, view, false);
     setMode("view");
     setDraft(null);
+    setSelectedStroke(null);
     setSelectedEye(null);
     if (!e) toast("Restored to original");
   };
@@ -4825,6 +4826,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const railTool = (m, stampM) => {
     if (mode === "view") {
       if (stampM) setStampMode(stampM); // entering: just the brush mode for new strokes
+      setSelectedStroke(null);
       setMode(m);
       return;
     }
@@ -4903,52 +4905,44 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             min={brushMin} max={brushMax} step={1} value={brushRadius}
             onChange={(e) => setBrushRadius(parseFloat(e.target.value))}
           />)}
-        {hudField("Feather", Math.round(curFeather * 100), "%", !!selStroke,
-          <RangeTrack
-            min={0} max={80} step={1} value={Math.round(curFeather * 100)}
-            onPointerDown={snapshot}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value) / 100;
-              if (selectedStroke != null) {
-                setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, feather: v } : s)));
-              } else {
-                setFeather(v);
-              }
-            }}
-          />)}
-        {hudField("Opacity", Math.round(curOpacity * 100), "%", !!selStroke,
-          <RangeTrack
-            min={10} max={100} step={1} value={Math.round(curOpacity * 100)}
-            onPointerDown={snapshot}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value) / 100;
-              if (selectedStroke != null) {
-                setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, opacity: v } : s)));
-              } else {
-                setStampOpacity(v);
-              }
-            }}
-          />)}
-        {selStroke && (
-          <div className="selchip">
-            <i className="sdot" /><span className="selchip-text">{STAMP_MODE_LABEL[selStroke.mode || "clone"]} stroke</span>
-            <Tip text="Delete stroke (Delete)">
-              <button
-                className="ib"
-                onClick={() => {
-                  snapshot();
-                  setStamp((prev) => prev.filter((_, i) => i !== selectedStroke));
-                  setSelectedStroke(null);
-                }}
-                aria-label="Delete stroke"
-              >
-                {TOOL_ICON.trash}
-              </button>
-            </Tip>
-            <Tip text="Deselect — Feather/Opacity go back to new strokes">
-              <button className="ib" onClick={() => setSelectedStroke(null)} aria-label="Deselect stroke">{I.close}</button>
-            </Tip>
-          </div>
+        {/* Remove picks its own edge per pixel (removeTool's textureFill)
+            and always removes fully — no Feather/Opacity to set */}
+        {(selStroke ? selStroke.mode === "remove" : stampMode === "remove") ? (
+          <Tip text="Remove blends its edge automatically: it fades into matching background and stays solid over what's being removed">
+            <div className="edge-auto">
+              <b>Edge</b>
+              <span>Auto</span>
+            </div>
+          </Tip>
+        ) : (
+          <>
+          {hudField("Feather", Math.round(curFeather * 100), "%", !!selStroke,
+            <RangeTrack
+              min={0} max={80} step={1} value={Math.round(curFeather * 100)}
+              onPointerDown={snapshot}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value) / 100;
+                if (selectedStroke != null) {
+                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, feather: v } : s)));
+                } else {
+                  setFeather(v);
+                }
+              }}
+            />)}
+          {hudField("Opacity", Math.round(curOpacity * 100), "%", !!selStroke,
+            <RangeTrack
+              min={10} max={100} step={1} value={Math.round(curOpacity * 100)}
+              onPointerDown={snapshot}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value) / 100;
+                if (selectedStroke != null) {
+                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, opacity: v } : s)));
+                } else {
+                  setStampOpacity(v);
+                }
+              }}
+            />)}
+          </>
         )}
         {NATIVE && stampMode === "remove" && (
           <>
@@ -5211,7 +5205,6 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 src={editSrcURL(photo)}
                 adjust={displayAdjust}
                 stamp={displayStamp}
-                draft={mode === "stamp" && !compareBefore ? draft : null}
                 redeye={displayRedEye}
                 texRegion={baseTexRegion}
                 origDiag={origDiag}
@@ -5223,7 +5216,6 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                   src={tile.url}
                   adjust={displayAdjust}
                   stamp={displayStamp}
-                  draft={mode === "stamp" && !compareBefore ? draft : null}
                   redeye={displayRedEye}
                   texRegion={tileTexRegion}
                   origDiag={origDiag}

@@ -99,11 +99,13 @@ function bilinear(src, w, h, fx, fy, out, o) {
    LaMa only needs a margin around the hole, and every extra pixel of
    context costs resolution once it's squeezed into 512² — so it runs on
    a tighter SQUARE around the hole (LAMA_CONTEXT × the hole's size on each
-   side), pasted back into the full crop. Tight on purpose: with more
-   context a hole next to a similar object (a car beside the removed car)
-   gets that object continued into it; 0.15 was the cleanest on both test
-   photos (0.35 left a car-shaped ghost). */
-const LAMA_CONTEXT = 0.15;
+   side), pasted back into the full crop. 0.15 at first (more context had
+   continued a car beside a removed car into the hole), but that left LaMa
+   too little to see of a TEXTURE: a box removed from rippled water came
+   back as a smooth grey blob, the kerb under it smeared. At 0.6 the
+   ripples and the kerb continue; the resolution this costs (wider square
+   into the same 512²) is what removeTool's textureFill gives back. */
+const LAMA_CONTEXT = 0.6;
 async function lamaRun(rgb, hole, w, h) {
   let hx0 = w, hy0 = h, hx1 = -1, hy1 = -1;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (hole[y * w + x]) { if (x < hx0) hx0 = x; if (x > hx1) hx1 = x; if (y < hy0) hy0 = y; if (y > hy1) hy1 = y; }
@@ -137,15 +139,16 @@ async function lamaRunSquare(rgb, hole, w, h) {
   const img = new Float32Array(3 * N), mask = new Float32Array(N), px = new Float32Array(3);
   for (let y = 0; y < LAMA; y++) for (let x = 0; x < LAMA; x++) {
     const q = y * LAMA + x;
-    // outside the scaled crop: clamp = edge replication; always "known"
+    // outside the scaled crop: clamp = edge replication, "known" — unless
+    // what it replicates is hole: a hole touching the photo's edge (a yacht
+    // cut by the frame) otherwise showed LaMa a strip of the first guess
+    // as real, and it continued that into a dark hump on the horizon
     const fx = (Math.min(x, sw - 1) + 0.5) / k - 0.5, fy = (Math.min(y, sh - 1) + 0.5) / k - 0.5;
     bilinear(rgb, w, h, fx, fy, px, 0);
     img[q] = px[0] / 255; img[N + q] = px[1] / 255; img[2 * N + q] = px[2] / 255;
-    if (x < sw && y < sh) {
-      // a 512-cell is "hole" if the crop pixel nearest its center is
-      const hx = Math.min(w - 1, Math.max(0, Math.round(fx))), hy = Math.min(h - 1, Math.max(0, Math.round(fy)));
-      mask[q] = hole[hy * w + hx] ? 1 : 0;
-    }
+    // a 512-cell is "hole" if the crop pixel nearest its center is
+    const hx = Math.min(w - 1, Math.max(0, Math.round(fx))), hy = Math.min(h - 1, Math.max(0, Math.round(fy)));
+    mask[q] = hole[hy * w + hx] ? 1 : 0;
   }
   // Grow the mask (8-neighbour, LAMA_DILATE cells): the brush edge leaves
   // the object's rim and shadow just outside the hole, and LaMa happily

@@ -167,8 +167,11 @@
      smooth), so the texture-preservation reasoning above still applies.
    ============================================================ */
 
-import { removeFill, hashRegion, neuralState, neuralVersion } from "./removeTool.mjs";
+import { removeFill, hashRegion, neuralState, neuralVersion, FILL_LOOK } from "./removeTool.mjs";
 
+const clamp255 = (v) => (v < 0 ? 0 : v > 255 ? 255 : v);
+const REMOVE_EDGE_IN = 0.15;      // Remove's automatic edge may fade up to this × radius inside the painted outline
+const STROKE_LOOK = "v3";         // bump when a stroke's output changes for the same input (keys the stroke cache)
 const DEFAULT_FEATHER = 0.3;      // default feather zone width, as a fraction of radius (Photoshop's brush "hardness", inverted)
 const DEFAULT_OPACITY = 1;        // default strength — 1 = fully replace, less = blend with the original (Photoshop's Opacity/Flow)
 const HEAL_RING_FRAC = 0.15;      // heal: boundary ring width, as a fraction of radius...
@@ -525,6 +528,7 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
   if (hit) {
     strokeCache.delete(hitKey); strokeCache.set(hitKey, hit); // LRU: most recent last
     replayStroke(hit, buf, channels);
+    if (hitKey === waitKey) pendingStrokes++; // its network result is still to come
     return;
   }
   const rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
@@ -587,33 +591,42 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     const holeKeys = [];
     for (const [key, v] of best) if (v.dist <= outer) holeKeys.push(key);
     const strokeKey = `${radius.toFixed(2)}|${feather}|${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(";")}`;
-    if (holeKeys.length) removed = removeFill(buf, width, height, channels, holeKeys, strokeKey);
+    // the edge is automatic (removeTool's textureFill): the band from the
+    // footprint's edge to a little inside the outline the user painted
+    const band = Math.max(2, outer - radius * (1 - REMOVE_EDGE_IN));
+    if (holeKeys.length) removed = removeFill(buf, width, height, channels, holeKeys, strokeKey, band);
     // still being filled in the background (removeTool's setAsyncFill):
     // leave the area as it is until the result lands and re-renders
-    if (!removed) return;
+    if (!removed) { if (holeKeys.length) pendingStrokes++; return; }
+    if (!removed.final) pendingStrokes++;
   }
 
   const written = [];
   for (const [key, v] of best) {
     // ring pixels (heal only, dist > outer) land at alphaGeom 0 here and
     // are never written — they're read-only boundary samples
-    const alphaGeom = 1 - smoothstep(radius, outer, v.dist);
+    const rem = removed && removed.get(key);
+    if (removed && !rem) continue;
+    // Remove: its own automatic edge, and no partial opacity (half a
+    // removed object is never what's wanted)
+    const alphaGeom = rem ? rem[3] : 1 - smoothstep(radius, outer, v.dist);
     if (alphaGeom <= 0) continue;
     const x = key % width, y = (key - x) / width;
     // DITHERED feather — see the module header's own section on this.
     // Not color correction: this never reads the destination's own
     // surrounding content, only the brush's geometric falloff.
     const dithered = alphaGeom >= 1 ? 1 : ditherThreshold(x, y) < alphaGeom ? 1 : 0;
-    const alpha = dithered * opacity;
+    const alpha = rem ? dithered : dithered * opacity;
     if (alpha <= 0) continue;
     // Clone: raw 1:1 copy — no correction added to sr/sg/sb, matching real
     // Photoshop's Clone Stamp (see module header). Heal: the same source
     // pixel, re-toned by the interpolated boundary correction.
-    const [sr, sg, sb] = removed ? removed.get(key) : healed ? healed.get(key) : sampleNearest(snap, rw, rh, 3, x + v.dx - rx0, y + v.dy - ry0);
+    const [sr, sg, sb] = rem || (healed ? healed.get(key) : sampleNearest(snap, rw, rh, 3, x + v.dx - rx0, y + v.dy - ry0));
     const o = key * channels;
-    buf[o] = buf[o] * (1 - alpha) + sr * alpha;
-    buf[o + 1] = buf[o + 1] * (1 - alpha) + sg * alpha;
-    buf[o + 2] = buf[o + 2] * (1 - alpha) + sb * alpha;
+    // clamped by hand: a Node Buffer (export) wraps 256 → 0 instead
+    buf[o] = clamp255(buf[o] * (1 - alpha) + sr * alpha);
+    buf[o + 1] = clamp255(buf[o + 1] * (1 - alpha) + sg * alpha);
+    buf[o + 2] = clamp255(buf[o + 2] * (1 - alpha) + sb * alpha);
     written.push(key);
   }
   const keys = Int32Array.from(written), rgb = new Uint8Array(keys.length * 3);
@@ -660,7 +673,7 @@ const strokeCache = new Map();
 let strokeCacheBytes = 0;
 function strokeCacheKey(stroke, width, height, buf, channels, rx0, ry0, rx1, ry1) {
   const pts = stroke.points.map((p) => `${p.x},${p.y}${p.dx != null ? `,${p.dx},${p.dy}` : ""}`).join(";");
-  const ai = stroke.mode === "remove" ? neuralState() : "";
+  const ai = `${stroke.mode === "remove" ? `${neuralState()}|${FILL_LOOK}` : ""}|${STROKE_LOOK}`;
   // buffer type too: a Uint8ClampedArray rounds the blend, a Buffer truncates it
   return `${stroke.mode}|${stroke.radius}|${stroke.feather}|${stroke.opacity}|${stroke.dx},${stroke.dy}|${pts}|${width}x${height}x${channels}|${buf.constructor.name}|${ai}|${hashRegion(buf, width, channels, rx0, ry0, rx1, ry1)}`;
 }
@@ -847,7 +860,13 @@ export function findHealSource(buf, width, height, channels, pts, radius, feathe
    legitimately read pixels an earlier stroke in the same call already
    modified (matches stacking clone-stamp edits in Photoshop). No-ops
    when isEmptyStamp(stamp). */
+/* strokes the last applyStampToRGBBuffer left unfinished: a Remove stroke
+   still waiting for its background fill or its network result. 0 = what
+   it drew is final (every stroke's output is in the stroke cache). */
+let pendingStrokes = 0;
+export function stampPending() { return pendingStrokes; }
 export function applyStampToRGBBuffer(buf, width, height, channels, stamp) {
+  pendingStrokes = 0;
   if (isEmptyStamp(stamp)) return buf;
   for (const stroke of normalizeStamp(stamp)) {
     applyStrokeToBuffer(buf, width, height, channels, stroke);
@@ -862,8 +881,10 @@ export function applyStampToRGBBuffer(buf, width, height, channels, stamp) {
    stroke output (to store on disk); restoreStrokeCache walks a stroke
    list over a copy of the pristine pixels, asking `load(key)` for each
    stroke's stored output and replaying it, so its hash for the next
-   stroke is right — until the first one that isn't stored. After that, a
-   normal composite only computes what's actually missing. */
+   stroke is right. A stroke that isn't stored leaves its read box unknown,
+   so later strokes reading any of it are skipped too (their keys hash
+   those pixels); strokes elsewhere still restore. After that, a normal
+   composite only computes what's actually missing. */
 let strokeCacheSink = null;
 export function setStrokeCacheSink(fn) { strokeCacheSink = fn; }
 export function packStrokeEntry(entry) {
@@ -883,6 +904,8 @@ function unpackStrokeEntry(bytes) {
 }
 export async function restoreStrokeCache(buf, width, height, channels, stamp, load) {
   let restored = 0;
+  const unknown = []; // read boxes of strokes not restored: their pixels aren't final here
+  const touches = (b) => unknown.some((u) => b[0] <= u[2] && u[0] <= b[2] && b[1] <= u[3] && u[1] <= b[3]);
   for (const stroke of normalizeStamp(stamp)) {
     const radius = stroke.radius, pts = stroke.points;
     if (!(radius > 0) || !pts || !pts.length) continue;
@@ -894,11 +917,12 @@ export async function restoreStrokeCache(buf, width, height, channels, stamp, lo
     const reach = outer + (heal ? Math.max(HEAL_RING_MIN, radius * HEAL_RING_FRAC) : 0);
     const box = readBox(pts, dxs, dys, reach, width, height);
     if (!box) continue;
+    if (touches(box)) { unknown.push(box); continue; }
     const key = strokeCacheKey(stroke, width, height, buf, channels, ...box);
     let entry = strokeCache.get(key);
     if (!entry) {
       entry = unpackStrokeEntry(await load(key));
-      if (!entry) break;
+      if (!entry) { unknown.push(box); continue; }
       strokeCachePut(key, entry, false);
       restored++;
     }
