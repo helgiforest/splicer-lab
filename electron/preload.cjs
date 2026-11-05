@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld("meridian", {
   renderTile: (p, t) => ipcRenderer.invoke("render-tile", p, t),
   readExif: (p) => ipcRenderer.invoke("read-exif", p),
   logError: (message) => ipcRenderer.invoke("log-error", message),
+  // local neural inpainting for the stamp tool's Remove mode (MI-GAN, runs
+  // in the main process — electron/neuralFill.mjs); rgb/hole are Uint8Arrays
+  neuralInpaint: (job) => ipcRenderer.invoke("neural-inpaint", job),
   onExportProgress: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("export-progress", handler);

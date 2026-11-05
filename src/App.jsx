@@ -1,9 +1,15 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, cloneElement, Children } from "react";
 import { createPortal } from "react-dom";
 import {
-  defaultAdjust, isDefaultAdjust, compileAdjust, applyAdjustToRGBBuffer,
+  CURRENT_PV, defaultAdjust, normalizeAdjust, isDefaultAdjust, compileAdjust, needsGuides, computeGuides, neutralizeWhiteBalance,
+  applyAdjustToRGBBuffer, DEHAZE_T_MIN, DEHAZE_OMEGA,
 } from "../electron/colorAdjust.mjs";
-import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp } from "../electron/stampTool.mjs";
+import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp, findHealSource } from "../electron/stampTool.mjs";
+import { setNeuralEnabled, takeNeuralJobs, putNeuralResult } from "../electron/removeTool.mjs";
+import {
+  isEmptyRedEye, normalizeRedEye, detectRedEye, applyRedEyeToRGBBuffer, mapRedEye,
+  REDEYE_DEFAULT_SIZE, REDEYE_DEFAULT_DARKEN,
+} from "../electron/redEyeTool.mjs";
 
 /* ============================================================
    SPLICER LAB — a focused photo tool (desktop build)
@@ -79,6 +85,7 @@ function mapStampStrokes(stamp, origW, origH, e, s, outW, outH) {
       radius: stroke.radius * s,
       feather: stroke.feather,
       opacity: stroke.opacity,
+      mode: stroke.mode,
       points: stroke.points.map((p) => {
         const [x, y] = project(p.x, p.y);
         if (p.dx === undefined) return { x, y };
@@ -90,6 +97,18 @@ function mapStampStrokes(stamp, origW, origH, e, s, outW, outH) {
       }),
     };
   });
+}
+
+/* Red-eye corrections, through the same crop/rotate/scale forward
+   projection as mapStampStrokes above (centers as points; each ellipse's
+   shape rotated + scaled by mapRedEye itself). */
+function mapRedEyeEdits(redeye, origW, origH, e, s, outW, outH) {
+  if (isEmptyRedEye(redeye)) return [];
+  const t = rad(e.theta);
+  return mapRedEye(redeye, (x, y) => {
+    const [ox, oy] = rot(x - origW / 2 - e.qcx, y - origH / 2 - e.qcy, t);
+    return [outW / 2 + s * ox, outH / 2 + s * oy];
+  }, t, s);
 }
 
 /* bake a small edited preview from the PROXY (fast even for 200-MP files) */
@@ -117,13 +136,16 @@ async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
     ctx.translate(-e.qcx * s0, -e.qcy * s0);
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
     const stampData = e.stamp || e.heal;
-    if (!isEmptyStamp(stampData) || !isDefaultAdjust(e.adjust)) {
+    if (!isEmptyStamp(stampData) || !isEmptyRedEye(e.redeye) || !isDefaultAdjust(e.adjust)) {
       const id = ctx.getImageData(0, 0, outW, outH);
       if (!isEmptyStamp(stampData)) {
         applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(stampData, origW, origH, e, s, outW, outH));
       }
+      if (!isEmptyRedEye(e.redeye)) {
+        applyRedEyeToRGBBuffer(id.data, outW, outH, 4, mapRedEyeEdits(e.redeye, origW, origH, e, s, outW, outH));
+      }
       if (!isDefaultAdjust(e.adjust)) {
-        applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust);
+        applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust, { scale: s, origDiag: Math.hypot(origW, origH) });
       }
       ctx.putImageData(id, 0, 0);
     }
@@ -167,6 +189,24 @@ const CSS = `
   --seg-on: #262b36;
   --strip: #101217;
   --dim: rgba(8,9,11,.72);
+  /* floating-tools look: canvas, glass rail/HUD, slider tracks */
+  --accent-text: #F3C34F;
+  --accent-soft: rgba(243,195,79,.14);
+  --focus: rgba(243,195,79,.6);
+  --canvas: #08090B;
+  --glass: rgba(27,30,37,.72);
+  --glass-stroke: rgba(255,255,255,.09);
+  --glass-hi: rgba(255,255,255,.06);
+  --glass-hover: rgba(255,255,255,.07);
+  --glass-shadow: 0 12px 34px rgba(0,0,0,.45), 0 1px 2px rgba(0,0,0,.35);
+  --well: rgba(0,0,0,.28);
+  --track: #2B2F39;
+  --thumb: #F4F5F7;
+  --thumb-ring: rgba(0,0,0,.35);
+  --tip-bg: #2A2E38;
+  --tip-text: #F2F3F5;
+  --kbd-bg: rgba(255,255,255,.07);
+  --kbd-stroke: rgba(255,255,255,.12);
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
 }
@@ -198,6 +238,23 @@ const CSS = `
   --seg-on: #FFFFFF;
   --strip: #E9EAEE;
   --dim: rgba(238,239,242,.8);
+  --accent-text: #9A6500;
+  --accent-soft: rgba(224,162,31,.16);
+  --focus: rgba(224,162,31,.7);
+  --canvas: #E2E3E8;
+  --glass: rgba(255,255,255,.78);
+  --glass-stroke: rgba(18,20,26,.09);
+  --glass-hi: rgba(255,255,255,.9);
+  --glass-hover: rgba(18,20,26,.06);
+  --glass-shadow: 0 12px 34px rgba(30,34,45,.16), 0 1px 2px rgba(30,34,45,.10);
+  --well: rgba(18,20,26,.06);
+  --track: #DDE0E6;
+  --thumb: #FFFFFF;
+  --thumb-ring: rgba(18,20,26,.22);
+  --tip-bg: #1F2128;
+  --tip-text: #F4F5F7;
+  --kbd-bg: rgba(18,20,26,.06);
+  --kbd-stroke: rgba(18,20,26,.14);
 }
 button { font-family: inherit; cursor: pointer; }
 /* a button clicked with a mouse shouldn't keep a visible focus ring
@@ -368,12 +425,17 @@ input, select { font-family: inherit; }
 .editor { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column; z-index: 100; }
 .editor .topbar { border-bottom-color: var(--stroke-soft); }
 .ed-body { flex: 1; display: flex; min-height: 0; }
+/* canvas column: the stage, with the floating-look HUD docked under it
+   (in the flow, at a fixed height — the stage only resizes when a mode
+   starts/ends, exactly like the old toolbelt, so the mode-driven refit
+   suppression and crop's refit-on-enter keep working unchanged) */
+.workspace { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; background: var(--canvas); }
 .stage { flex: 1; position: relative; overflow: hidden; min-height: 0; cursor: grab; }
 .stage:active { cursor: grabbing; }
 
 /* ---------- metadata panel ---------- */
 .meta {
-  width: 264px; flex-shrink: 0;
+  width: 296px; flex-shrink: 0;
   border-left: 1px solid var(--stroke-soft); background: var(--surface);
   padding: 16px 16px 12px; overflow-y: auto; font-size: 12px;
 }
@@ -400,32 +462,107 @@ input, select { font-family: inherit; }
    with no visible boundary — the border makes the box's extent legible in
    either theme instead of relying on a background-color contrast that
    only exists in one of them. */
-.histogram { width: 100%; height: 84px; display: block; border-radius: 4px; background: #14161B; border: 1px solid var(--stroke-soft); box-sizing: border-box; }
-.adj-row { margin-bottom: 12px; }
-.adj-row:last-child { margin-bottom: 0; }
-.adj-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
-.adj-label { color: var(--muted); font-size: 12px; }
-.adj-val {
-  font-family: var(--mono); font-size: 11.5px; color: var(--faint);
-  font-variant-numeric: tabular-nums;
+.histogram { width: 100%; height: 88px; display: block; border-radius: 10px; background: #0F1115; border: 1px solid var(--stroke-soft); box-sizing: border-box; }
+.pv-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 10px 0 2px; font-size: 12px; color: var(--muted);
 }
-.adj-val.nonzero { color: var(--accent); }
-.adj-slider { position: relative; height: 20px; display: flex; align-items: center; }
-.adj-slider .notch {
-  position: absolute; left: 50%; top: 0; width: 1px; height: 6px;
-  background: var(--faint); transform: translateX(-50%); pointer-events: none;
+.pv-note .chip { padding: 3px 11px; }
+.wbpick-overlay { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
+
+/* small icon button (section heads, HUD chips) */
+.ib {
+  width: 26px; height: 26px; border-radius: 7px; display: inline-grid; place-items: center; flex-shrink: 0;
+  background: none; border: 0; color: var(--faint); transition: background .12s, color .12s, transform .08s;
 }
-input[type="range"].adj {
-  -webkit-appearance: none; position: relative; width: 100%; height: 3px;
-  border-radius: 2px; outline: none; background: var(--faint);
+.ib:hover { background: var(--hover); color: var(--text); }
+.ib:active { transform: scale(.94); }
+.ib:disabled { opacity: .32; pointer-events: none; }
+.ib.on, .ib[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
+
+/* side panel tabs */
+.side-tabs { display: flex; padding: 2px; border-radius: 9px; background: var(--raised); margin-bottom: 14px; }
+.side-tabs button {
+  flex: 1; height: 28px; border-radius: 7px; border: 0; background: none; font-size: 12px; font-weight: 600;
+  color: var(--muted); transition: background .12s, color .12s;
 }
-input[type="range"].adj::-webkit-slider-thumb {
-  -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
-  background: #fff; border: none; box-shadow: 0 1px 4px rgba(0,0,0,.5); cursor: pointer;
+.side-tabs button:hover { color: var(--text); }
+.side-tabs button[aria-selected="true"] { background: var(--seg-on); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.22), 0 0 0 .5px var(--stroke-soft); }
+
+/* collapsible develop sections */
+.sec { border-top: 1px solid var(--stroke-soft); margin-top: 12px; }
+.sec-head { display: flex; align-items: center; gap: 2px; height: 44px; }
+.sec-toggle {
+  flex: 1; display: flex; align-items: center; gap: 8px; height: 30px; margin-left: -8px; padding: 0 8px;
+  border-radius: 8px; border: 0; background: none; font-size: 12.5px; font-weight: 650; color: var(--text); text-align: left;
+  transition: background .12s;
 }
-input[type="range"].adj::-moz-range-thumb {
-  width: 14px; height: 14px; border-radius: 50%; background: #fff; border: none; cursor: pointer;
+.sec-toggle:hover { background: var(--hover); }
+.sec-toggle .chev { color: var(--faint); transition: transform .2s; }
+.sec.closed .sec-toggle .chev { transform: rotate(-90deg); }
+.sec-count {
+  min-width: 18px; height: 18px; padding: 0 6px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent-soft); color: var(--accent-text); font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums;
 }
+.sec-body { padding-bottom: 6px; }
+
+/* develop slider row */
+.sl { padding: 3px 0 5px; }
+.sl-head { display: flex; align-items: center; justify-content: space-between; height: 20px; }
+.sl-label { font-size: 12.5px; color: var(--muted); transition: color .12s; }
+.sl:hover .sl-label { color: var(--text); }
+.sl-val {
+  min-width: 40px; text-align: right; font-size: 12px; font-weight: 600;
+  font-variant-numeric: tabular-nums; color: var(--faint);
+}
+.sl.mod .sl-val { color: var(--accent-text); }
+
+/* RangeTrack: drawn track/fill/thumb under a transparent native range
+   input whose own thumb is the same 14px wide, so the thumb drawn at
+   7px + (100% − 14px)·p sits exactly where the real one is */
+.track { position: relative; height: 22px; }
+.track .line {
+  position: absolute; left: 0; right: 0; top: 50%; height: 4px; margin-top: -2px; border-radius: 99px;
+  background: var(--track); transition: height .14s, margin .14s; pointer-events: none;
+}
+.track:hover .line, .track:active .line, .track:hover .fill, .track:active .fill { height: 6px; margin-top: -3px; }
+.track.grad .line { background: var(--g); opacity: .85; }
+.track.grad:hover .line, .track.grad:active .line { opacity: 1; }
+.track .fill {
+  position: absolute; top: 50%; height: 4px; margin-top: -2px; border-radius: 99px; background: var(--accent);
+  transition: height .14s, margin .14s; pointer-events: none;
+  left: calc(7px + (100% - 14px) * var(--a)); width: calc((100% - 14px) * (var(--b) - var(--a)));
+}
+.track .mid {
+  position: absolute; top: 50%; width: 2px; height: 10px; margin: -5px 0 0 -1px; border-radius: 1px;
+  background: var(--faint); opacity: .55; pointer-events: none;
+}
+.track.grad .mid { background: var(--surface); opacity: .9; }
+.track .thumb {
+  position: absolute; top: 50%; left: calc(7px + (100% - 14px) * var(--p)); width: 14px; height: 14px; margin: -7px 0 0 -7px;
+  border-radius: 50%; background: var(--thumb); box-shadow: 0 0 0 1px var(--thumb-ring), 0 1px 4px rgba(0,0,0,.3);
+  transition: transform .14s, box-shadow .14s; pointer-events: none;
+}
+.track:hover .thumb { transform: scale(1.12); }
+.track:active .thumb { transform: scale(1.22); box-shadow: 0 0 0 1px var(--thumb-ring), 0 0 0 6px var(--accent-soft), 0 2px 6px rgba(0,0,0,.35); }
+.track:has(input:focus-visible) .thumb { box-shadow: 0 0 0 1px var(--thumb-ring), 0 0 0 4px var(--focus); }
+.track .bubble {
+  position: absolute; bottom: 21px; left: calc(7px + (100% - 14px) * var(--p)); transform: translate(-50%, 4px) scale(.9);
+  min-width: 30px; height: 22px; padding: 0 7px; border-radius: 7px; display: grid; place-items: center;
+  background: var(--tip-bg); color: var(--tip-text); font-size: 11.5px; font-weight: 650; font-variant-numeric: tabular-nums;
+  box-shadow: 0 6px 16px rgba(0,0,0,.3); opacity: 0; pointer-events: none; transition: opacity .12s, transform .12s; z-index: 2;
+}
+.track .bubble::after {
+  content: ""; position: absolute; left: 50%; bottom: -4px; width: 8px; height: 8px; margin-left: -4px;
+  background: var(--tip-bg); transform: rotate(45deg); border-radius: 0 0 2px 0;
+}
+.track:active .bubble { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.track input[type="range"] {
+  -webkit-appearance: none; appearance: none; position: absolute; inset: 0; width: 100%; height: 100%;
+  margin: 0; padding: 0; background: transparent; opacity: 0; cursor: pointer; outline: none;
+}
+.track input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 22px; cursor: pointer; }
+.track input[type="range"]::-moz-range-thumb { width: 14px; height: 22px; border: 0; background: transparent; cursor: pointer; }
 
 .stars { display: inline-flex; gap: 2px; }
 .stars button {
@@ -540,6 +677,7 @@ input[type="range"].adj::-moz-range-thumb {
 .world { position: absolute; inset: 0; transform-origin: 0 0; }
 
 .stamp-overlay { position: absolute; inset: 0; cursor: none; touch-action: none; }
+.redeye-overlay { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
 .stamp-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .stamp-cursor {
   position: absolute; border-radius: 50%; box-sizing: border-box;
@@ -579,11 +717,6 @@ input[type="range"].adj::-moz-range-thumb {
 .h-e::after, .h-w::after { content: ""; position: absolute; top: 50%; transform: translateY(-50%); width: 3px; height: 26px; background: #fff; border-radius: 2px; }
 .h-e::after { right: 4px; } .h-w::after { left: 4px; }
 
-.toolbelt {
-  flex-shrink: 0; border-top: 1px solid var(--stroke-soft); background: var(--surface);
-  padding: 12px 18px 16px; display: flex; flex-direction: column; gap: 12px;
-}
-.aspects { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; justify-content: center; }
 .chip {
   background: transparent; border: 1px solid var(--stroke); color: var(--muted);
   border-radius: 999px; padding: 5px 13px; font-size: 12px;
@@ -591,28 +724,123 @@ input[type="range"].adj::-moz-range-thumb {
 }
 .chip:hover { color: var(--text); border-color: var(--faint); }
 .chip.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
-.chip.icon { padding: 5px 9px; display: inline-flex; }
-.chip:disabled { opacity: .35; cursor: default; pointer-events: none; }
 
-.rot-row { display: flex; align-items: center; gap: 14px; max-width: 620px; margin: 0 auto; width: 100%; }
-.rot-slider { flex: 1; position: relative; height: 26px; display: flex; align-items: center; }
-.rot-slider .notch { position: absolute; left: 50%; top: 0; width: 1px; height: 7px; background: var(--faint); }
-input[type="range"].rot {
-  -webkit-appearance: none; position: relative; width: 100%; height: 3px; border-radius: 2px;
-  background: var(--faint); outline: none;
+/* ---------- floating tools: glass rail + HUD ---------- */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(22px) saturate(1.6); -webkit-backdrop-filter: blur(22px) saturate(1.6);
+  border: 1px solid var(--glass-stroke);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-hi);
 }
-input[type="range"].rot::-webkit-slider-thumb {
-  -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
-  background: #fff; border: none; box-shadow: 0 1px 4px rgba(0,0,0,.5); cursor: pointer;
+.rail-dock { width: 64px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; background: var(--canvas); }
+.rail { display: flex; flex-direction: column; gap: 2px; padding: 5px; border-radius: 14px; }
+.rail-sep { height: 1px; margin: 4px 7px; background: var(--glass-stroke); }
+.rail-group { display: flex; flex-direction: column; gap: 2px; border-radius: 10px; transition: background .18s, box-shadow .18s; }
+.rail-group.engaged { background: var(--glass-hover); box-shadow: inset 0 0 0 1px var(--glass-stroke); }
+.tool {
+  position: relative; width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center;
+  background: none; border: 0; color: var(--muted); transition: background .12s, color .12s, transform .08s, opacity .12s;
 }
-input[type="range"].rot::-moz-range-thumb {
-  width: 16px; height: 16px; border-radius: 50%; background: #fff; border: none; cursor: pointer;
+.tool:hover { background: var(--glass-hover); color: var(--text); }
+.tool:active { transform: scale(.93); }
+.tool:disabled { opacity: .3; pointer-events: none; }
+.tool[aria-pressed="true"] {
+  background: var(--accent); color: var(--accent-ink);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 2px 8px rgba(243,195,79,.25);
 }
-.degree {
-  font-family: var(--mono); font-size: 13px; color: var(--text);
-  width: 64px; text-align: right; font-variant-numeric: tabular-nums;
+.tool svg { width: 18px; height: 18px; }
+
+.hud-dock { height: 76px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0 12px; }
+.hud {
+  display: flex; align-items: center; gap: 2px; padding: 6px; border-radius: 16px;
+  max-width: 100%; white-space: nowrap; animation: hudin .22s cubic-bezier(.2,.9,.25,1.1);
 }
-.degree.zero { color: var(--faint); }
+@keyframes hudin { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+.hud-float { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 6; animation: none; }
+.hsep { width: 1px; height: 26px; background: var(--glass-stroke); margin: 0 5px; flex-shrink: 0; }
+.hud-chip {
+  display: flex; align-items: center; gap: 9px; height: 40px; padding: 0 12px 0 8px; border-radius: 10px;
+  border: 0; background: none; color: var(--text); white-space: nowrap; flex-shrink: 0;
+}
+button.hud-chip { transition: background .12s; }
+button.hud-chip:hover { background: var(--glass-hover); }
+.hud-chip .chip-ico {
+  width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent-text);
+}
+.hud-chip .chip-ico svg { width: 16px; height: 16px; }
+.hud-chip .chip-text { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.hud-chip .chip-name { font-size: 13px; font-weight: 650; line-height: 1; }
+.dots { display: flex; gap: 3px; }
+.dots i { width: 4px; height: 4px; border-radius: 2px; background: var(--faint); opacity: .7; transition: width .2s, background .2s, opacity .2s; }
+.dots i.on { width: 12px; background: var(--accent); opacity: 1; }
+.hud-hint { font-size: 12.5px; color: var(--muted); padding: 0 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.kbd {
+  display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: 5px; font: 600 10.5px/1 var(--mono); color: var(--muted);
+  background: var(--kbd-bg); border: 1px solid var(--kbd-stroke);
+}
+.brush-prev {
+  width: 40px; height: 40px; border-radius: 10px; background: var(--well); display: grid; place-items: center;
+  flex-shrink: 0; margin-right: 4px; overflow: hidden;
+}
+.brush-prev i { display: block; border-radius: 50%; }
+.hfield { width: 138px; flex-shrink: 1; min-width: 96px; padding: 3px 10px 0; display: flex; flex-direction: column; }
+.hfield.wide { width: 210px; }
+.hf-head { display: flex; align-items: baseline; justify-content: space-between; height: 15px; }
+.hf-head .lab {
+  font-size: 10.5px; font-weight: 600; color: var(--muted); letter-spacing: .02em;
+  display: flex; align-items: center; gap: 5px;
+}
+.hf-head .sdot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.hf-head .val { font-size: 12.5px; font-weight: 650; color: var(--text); font-variant-numeric: tabular-nums; }
+.hf-head .val em { font-style: normal; font-weight: 500; font-size: 10.5px; color: var(--muted); margin-left: 1px; }
+.hf-head .val.zero { color: var(--faint); }
+.hfield .track { height: 20px; }
+.selchip {
+  display: flex; align-items: center; gap: 2px; height: 32px; padding: 0 3px 0 10px; border-radius: 9px;
+  background: var(--accent-soft); color: var(--accent-text); font-size: 12px; font-weight: 600; white-space: nowrap;
+  margin-left: 4px; flex-shrink: 0;
+}
+.selchip .sdot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); margin-right: 5px; }
+.selchip .ib { color: var(--accent-text); }
+.selchip .ib:hover { background: var(--accent-soft); }
+.hud-seg { display: flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--well); flex-shrink: 0; }
+.hud-seg button {
+  height: 32px; padding: 0 10px; border-radius: 7px; border: 0; background: none; font-size: 12px; font-weight: 600; color: var(--muted);
+  transition: background .12s, color .12s; white-space: nowrap;
+}
+.hud-seg button:hover { color: var(--text); background: var(--glass-hover); }
+.hud-seg button[aria-pressed="true"] { background: var(--seg-on); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
+.hud .ib { width: 36px; height: 36px; border-radius: 10px; color: var(--muted); }
+.hud .ib:hover { background: var(--glass-hover); color: var(--text); }
+.hud .ib[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
+.hud-btn {
+  height: 40px; padding: 0 12px; border-radius: 10px; border: 0; background: none; font-size: 13px; font-weight: 550; color: var(--muted);
+  white-space: nowrap; transition: background .12s, color .12s; display: flex; align-items: center; gap: 8px;
+}
+.hud-btn:hover { background: var(--glass-hover); color: var(--text); }
+.hud-done {
+  height: 40px; padding: 0 8px 0 14px; border-radius: 10px; border: 0; background: var(--accent); color: var(--accent-ink);
+  font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 9px; white-space: nowrap; flex-shrink: 0;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35); transition: filter .12s, transform .08s;
+}
+.hud-done:hover { filter: brightness(1.07); }
+.hud-done:active { transform: translateY(.5px); }
+.hud-done .kbd { color: rgba(36,26,3,.7); background: rgba(36,26,3,.1); border-color: rgba(36,26,3,.16); }
+
+/* topbar: primary Export */
+.btn-export {
+  height: 32px; padding: 0 14px 0 12px; border-radius: 8px; border: 0; background: var(--accent); color: var(--accent-ink);
+  font-weight: 650; font-size: 13px; display: inline-flex; align-items: center; gap: 7px; margin-left: 4px; flex-shrink: 0;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 1px 2px rgba(0,0,0,.25); transition: filter .12s, transform .08s;
+}
+.btn-export:hover { filter: brightness(1.07); }
+.btn-export:active { transform: translateY(.5px); }
+.crumbs { display: flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; min-width: 0; overflow: hidden; }
+.crumbs .roll { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.crumbs .sep { color: var(--faint); }
+.crumbs .file { color: var(--text); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
 
 /* ---------- dialog ---------- */
 .veil {
@@ -881,13 +1109,16 @@ async function bakeCanvas(photo, edits, scalePct = 100, maxDim = Infinity) {
   ctx.translate(-e.qcx, -e.qcy);
   ctx.drawImage(img, -iw / 2, -ih / 2);
   const stampData = e.stamp || e.heal;
-  if (!isEmptyStamp(stampData) || !isDefaultAdjust(e.adjust)) {
+  if (!isEmptyStamp(stampData) || !isEmptyRedEye(e.redeye) || !isDefaultAdjust(e.adjust)) {
     const id = ctx.getImageData(0, 0, outW, outH);
     if (!isEmptyStamp(stampData)) {
       applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(stampData, iw, ih, e, s, outW, outH));
     }
+    if (!isEmptyRedEye(e.redeye)) {
+      applyRedEyeToRGBBuffer(id.data, outW, outH, 4, mapRedEyeEdits(e.redeye, iw, ih, e, s, outW, outH));
+    }
     if (!isDefaultAdjust(e.adjust)) {
-      applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust);
+      applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust, { scale: s, origDiag: Math.hypot(iw, ih) });
     }
     ctx.putImageData(id, 0, 0);
   }
@@ -959,7 +1190,7 @@ const I = {
    it adds no wrapper element/box to the layout; the bubble itself renders
    through a portal so it always sits above everything, positioned from
    the trigger's live bounding box rather than any local stacking context. */
-function Tip({ text, children }) {
+function Tip({ text, children, side }) {
   const [pos, setPos] = useState(null);   // trigger anchor {x, y} once shown
   const [box, setBox] = useState(null);   // measured, viewport-clamped {left, top}
   const nodeRef = useRef(null);
@@ -973,7 +1204,7 @@ function Tip({ text, children }) {
       const r = nodeRef.current?.getBoundingClientRect();
       if (!r) return;
       setBox(null);
-      setPos({ x: r.left + r.width / 2, y: r.bottom + 8 });
+      setPos(side === "right" ? { x: r.right + 10, y: r.top + r.height / 2, right: true } : { x: r.left + r.width / 2, y: r.bottom + 8 });
     }, 1000);
   };
   const onLeave = () => { cancel(); setPos(null); setBox(null); };
@@ -987,6 +1218,7 @@ function Tip({ text, children }) {
     if (!pos || !bubbleRef.current) return;
     const r = bubbleRef.current.getBoundingClientRect();
     const margin = 8;
+    if (pos.right) { setBox({ left: pos.x, top: pos.y - r.height / 2 }); return; }
     const left = Math.max(margin, Math.min(pos.x - r.width / 2, window.innerWidth - margin - r.width));
     setBox({ left, top: pos.y });
   }, [pos]);
@@ -1009,7 +1241,7 @@ function Tip({ text, children }) {
     <>
       {merged}
       {pos && createPortal(
-        <div ref={bubbleRef} className="tip-bubble" style={{ left: box ? box.left : pos.x, top: pos.y }}>
+        <div ref={bubbleRef} className="tip-bubble" style={{ left: box ? box.left : pos.x, top: box ? box.top : pos.y }}>
           {text}
         </div>,
         document.body
@@ -1128,7 +1360,13 @@ async function sampleCroppedRGBBuffer(srcUrl, origW, origH, crop, maxDim) {
   if (!isEmptyStamp(e.stamp)) {
     applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(e.stamp, origW, origH, e, s, outW, outH));
   }
-  return { data: id.data, w: outW, h: outH };
+  if (!isEmptyRedEye(e.redeye)) {
+    applyRedEyeToRGBBuffer(id.data, outW, outH, 4, mapRedEyeEdits(e.redeye, origW, origH, e, s, outW, outH));
+  }
+  // guides: computed lazily by Histogram's draw() the first time a guide-
+  // reading slider is in use, then reused for every later tick on this
+  // same sample (they depend only on these pixels, not on slider values)
+  return { data: id.data, w: outW, h: outH, adjustOpts: { scale: s, origDiag: Math.hypot(origW, origH) }, guides: null };
 }
 
 function Histogram({ srcUrl, iw, ih, crop, adjust }) {
@@ -1141,7 +1379,10 @@ function Histogram({ srcUrl, iw, ih, crop, adjust }) {
     const canvas = canvasRef.current;
     if (!cached || !canvas) return;
     const buf = Uint8ClampedArray.from(cached.data);
-    applyAdjustToRGBBuffer(buf, cached.w, cached.h, 4, adjust);
+    if (!cached.guides && needsGuides(compileAdjust(adjust))) {
+      cached.guides = computeGuides(cached.data, cached.w, cached.h, 4, cached.adjustOpts);
+    }
+    applyAdjustToRGBBuffer(buf, cached.w, cached.h, 4, adjust, { ...cached.adjustOpts, guides: cached.guides });
     const rRaw = new Uint32Array(256), gRaw = new Uint32Array(256), bRaw = new Uint32Array(256);
     for (let i = 0; i < buf.length; i += 4) { rRaw[buf[i]]++; gRaw[buf[i + 1]]++; bRaw[buf[i + 2]]++; }
     const r = smoothHistBins(rRaw), g = smoothHistBins(gRaw), b = smoothHistBins(bRaw);
@@ -1209,13 +1450,15 @@ function Histogram({ srcUrl, iw, ih, crop, adjust }) {
 }
 
 /* ---------- develop panel: histogram + White Balance / Basic sliders ----------
-   No ML auto-enhance toggle and no gray-point eyedropper — manual sliders only. */
+   No ML auto-enhance toggle. The White Balance Selector (eyedropper, W) sits
+   in the Color group's header — see WBPickOverlay. */
 const ADJUST_GROUPS = [
   {
     title: "Color",
     fields: [
       { key: "temp", label: "Temperature", grad: "linear-gradient(90deg,#4f8fd9,#e8b23d)" },
       { key: "tint", label: "Tint", grad: "linear-gradient(90deg,#43b16a,#d6519b)" },
+      { key: "vibrance", label: "Vibrance" },
       { key: "saturation", label: "Saturation" },
     ],
   },
@@ -1226,48 +1469,142 @@ const ADJUST_GROUPS = [
       { key: "contrast", label: "Contrast" },
       { key: "highlights", label: "Highlights" },
       { key: "shadows", label: "Shadows" },
-      { key: "whitePoint", label: "White Point" },
-      { key: "blackPoint", label: "Black Point" },
+      // stored as whitePoint/blackPoint (unchanged keys, so older edits keep
+      // working); same direction in both process versions
+      { key: "whitePoint", label: "Whites" },
+      { key: "blackPoint", label: "Blacks" },
+    ],
+  },
+  {
+    title: "Presence",
+    fields: [
+      { key: "texture", label: "Texture" },
+      { key: "clarity", label: "Clarity" },
+      { key: "dehaze", label: "Dehaze" },
     ],
   },
 ];
 
-function DevelopPanel({ photo, iw, ih, crop, adjust, onAdjustChange, onSliderStart }) {
+/* A styled native range input: the track, fill and thumb are drawn
+   underneath and the real <input type="range"> sits on top, transparent,
+   with a thumb of the same 14px width — so dragging, clicking the track,
+   keyboard nudges and every onPointerDown/onChange/onDoubleClick handler
+   behave exactly as the bare input did; only the look changes. `origin`
+   is where the accent fill starts (0 for ±100 sliders, else the min). */
+function RangeTrack({ value, min, max, step = 1, origin = min, grad, bubble, ...inputProps }) {
+  const span = max - min || 1;
+  const p = clamp((value - min) / span, 0, 1);
+  const o = clamp((origin - min) / span, 0, 1);
+  return (
+    <div
+      className={`track ${grad ? "grad" : ""}`}
+      style={{ "--p": p, "--a": Math.min(p, o), "--b": Math.max(p, o), ...(grad ? { "--g": grad } : null) }}
+    >
+      <div className="line" />
+      {!grad && <div className="fill" />}
+      {o > 0 && o < 1 && <div className="mid" style={{ left: `calc(7px + (100% - 14px) * ${o})` }} />}
+      <div className="thumb" />
+      {bubble != null && <div className="bubble">{bubble}</div>}
+      <input type="range" min={min} max={max} step={step} value={value} {...inputProps} />
+    </div>
+  );
+}
+
+const fmtSigned = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(Math.round(v))}`;
+
+const CHEVRON = <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" className="chev"><path d="M6 9l6 6 6-6"/></svg>;
+const EYEDROPPER = <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 4.5l5 5"/><path d="M17 7l2.6-2.6a1.9 1.9 0 0 0-2.7-2.7L14.3 4.3"/><path d="M15.5 8.5L6 18l-3 1 1-3 9.5-9.5"/></svg>;
+const SECTIONS_KEY = "splicer.develop.closed";
+
+function DevelopPanel({ photo, iw, ih, crop, adjust, onAdjustChange, onSliderStart, wbPicking, onToggleWBPick }) {
   const setField = (key, v) => onAdjustChange({ ...adjust, [key]: v });
+  const legacy = (adjust.pv || 1) < CURRENT_PV;
+  // which sections are folded — a per-viewer convenience, so localStorage
+  const [closed, setClosed] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(SECTIONS_KEY)) || {}; } catch { return {}; }
+  });
+  const toggle = (title) => setClosed((c) => {
+    const next = { ...c, [title]: !c[title] };
+    try { localStorage.setItem(SECTIONS_KEY, JSON.stringify(next)); } catch { /* storage off */ }
+    return next;
+  });
   return (
     <>
-      <h4>Histogram</h4>
       <Histogram srcUrl={proxyURL(photo)} iw={iw} ih={ih} crop={crop} adjust={adjust} />
-      {ADJUST_GROUPS.map((group) => (
-        <div key={group.title}>
-          <div className="divider" />
-          <h4>{group.title}</h4>
-          {group.fields.map((f) => {
-            const v = adjust[f.key] || 0;
-            return (
-              <div className="adj-row" key={f.key}>
-                <div className="adj-head">
-                  <span className="adj-label">{f.label}</span>
-                  <span className={`adj-val ${v !== 0 ? "nonzero" : ""}`}>
-                    {v > 0 ? "+" : ""}{Math.round(v)}%
-                  </span>
-                </div>
-                <div className="adj-slider">
-                  <div className="notch" />
-                  <input
-                    type="range" className="adj" min={-100} max={100} step={1}
-                    value={v}
-                    style={f.grad ? { background: f.grad } : undefined}
-                    onPointerDown={onSliderStart}
-                    onChange={(e) => setField(f.key, parseFloat(e.target.value))}
-                    onDoubleClick={() => setField(f.key, 0)}
-                  />
-                </div>
-              </div>
-            );
-          })}
+      {legacy && (
+        /* An older edit renders with the process version it was made in
+           (see colorAdjust.mjs's PROCESS VERSIONS) — offered, never forced:
+           updating changes how Exposure/Contrast/Highlights/Shadows/Whites/
+           Blacks look on this photo, so it's the user's call. Undoable
+           (onSliderStart snapshots first, same as a slider drag). */
+        <div className="pv-note">
+          <span>Older processing</span>
+          <button
+            className="chip"
+            onClick={() => { onSliderStart(); onAdjustChange({ ...adjust, pv: CURRENT_PV }); }}
+          >
+            Update
+          </button>
         </div>
-      ))}
+      )}
+      {ADJUST_GROUPS.map((group) => {
+        const changed = group.fields.filter((f) => (adjust[f.key] || 0) !== 0).length;
+        const isClosed = !!closed[group.title];
+        return (
+          <div className={`sec ${isClosed ? "closed" : ""}`} key={group.title}>
+            <div className="sec-head">
+              <button className="sec-toggle" onClick={() => toggle(group.title)} aria-expanded={!isClosed}>
+                {CHEVRON}
+                <span>{group.title}</span>
+                {changed > 0 && <span className="sec-count">{changed}</span>}
+              </button>
+              {changed > 0 && (
+                <Tip text={`Reset ${group.title}`}>
+                  <button
+                    className="ib"
+                    onClick={() => {
+                      onSliderStart();
+                      onAdjustChange({ ...adjust, ...Object.fromEntries(group.fields.map((f) => [f.key, 0])) });
+                    }}
+                    aria-label={`Reset ${group.title}`}
+                  >
+                    {I.reset}
+                  </button>
+                </Tip>
+              )}
+              {group.title === "Color" && (
+                <Tip text="White balance selector (W) — click something that should be neutral gray or white">
+                  <button className={`ib ${wbPicking ? "on" : ""}`} onClick={onToggleWBPick} aria-label="White balance selector">
+                    {EYEDROPPER}
+                  </button>
+                </Tip>
+              )}
+            </div>
+            {!isClosed && (
+              <div className="sec-body">
+                {group.fields.map((f) => {
+                  const v = adjust[f.key] || 0;
+                  return (
+                    <div className={`sl ${v !== 0 ? "mod" : ""}`} key={f.key}>
+                      <div className="sl-head">
+                        <span className="sl-label">{f.label}</span>
+                        <span className="sl-val">{fmtSigned(v)}</span>
+                      </div>
+                      <RangeTrack
+                        min={-100} max={100} origin={0} value={v} grad={f.grad} bubble={fmtSigned(v)}
+                        className="adj"
+                        onPointerDown={onSliderStart}
+                        onChange={(e) => setField(f.key, parseFloat(e.target.value))}
+                        onDoubleClick={() => setField(f.key, 0)}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </>
   );
 }
@@ -1424,7 +1761,14 @@ const GL_FRAG = `
 // vertex shaders.
 precision highp float;
 uniform sampler2D u_tex;
-uniform float u_wbGainR, u_wbGainG, u_wbGainB;
+// guide planes (colorAdjust.mjs computeGuides): r = fine base, g = mid
+// base, b = coarse base, a = smoothed dark channel (sRGB-encoded linear).
+// Same extent as u_tex, LINEAR-filtered — the GPU twin of sampleGuide().
+uniform sampler2D u_guide;
+uniform float u_useGuide;
+// white balance as one 3×3 on linear sRGB: pv 1's per-channel gains are
+// its diagonal, pv 2's is the Bradford white-balance matrix
+uniform mat3 u_wbMat;
 uniform float u_satGain;
 uniform float u_exposureGain;
 uniform float u_contrastAmt;
@@ -1432,7 +1776,11 @@ uniform float u_highlightGain;
 uniform float u_shadowGain;
 uniform float u_whiteShift;
 uniform float u_blackShift;
+uniform float u_pv;
+uniform float u_vibrance, u_textureAmt, u_clarityAmt, u_dehazeAmt, u_airlight;
+uniform float u_shoulderKnee, u_hiStops, u_shStops, u_contrastS, u_whitesAmt, u_blacksAmt;
 varying vec2 v_uv;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 float smoothstepClamp(float e0, float e1, float x) {
   float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
@@ -1455,32 +1803,103 @@ vec3 linearToSrgb(vec3 c) {
   vec3 hi = 1.055 * pow(max(c, 0.0), vec3(1.0 / 2.4)) - 0.055;
   return mix(lo, hi, step(0.0031308, c));
 }
+float srgbToLinear1(float c) { return c <= 0.04045 ? c / 12.92 : pow(max((c + 0.055) / 1.055, 0.0), 2.4); }
+float linearToSrgb1(float c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(max(c, 0.0), 1.0 / 2.4) - 0.055; }
+
+// texture + clarity luminance shift (colorAdjust.mjs detailShift)
+float detailShift(vec3 c, vec4 gd, float lumIn) {
+  float lum = clamp(dot(c, LUMA), 0.0, 1.0);
+  float mid = 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0);
+  return u_textureAmt * (lumIn - gd.r) + u_clarityAmt * (lumIn - gd.g) * (0.3 + 0.7 * mid);
+}
 
 void main() {
   vec3 tex = texture2D(u_tex, v_uv).rgb;
+  vec4 gd = texture2D(u_guide, v_uv);
+  bool useGuide = u_useGuide > 0.5;
 
   vec3 lin = srgbToLinear(tex);
-  lin *= vec3(u_wbGainR, u_wbGainG, u_wbGainB);
+  float lumIn = linearToSrgb1(dot(lin, LUMA));
+
+  if (useGuide && u_dehazeAmt != 0.0) {
+    float A = u_airlight;
+    float t = max(${DEHAZE_T_MIN.toFixed(6)}, 1.0 - ${DEHAZE_OMEGA.toFixed(6)} * srgbToLinear1(gd.a) / A);
+    if (u_dehazeAmt > 0.0) {
+      lin += ((lin - A) / t + A - lin) * u_dehazeAmt;
+    } else {
+      lin += (A - lin) * (-u_dehazeAmt * 0.5 * (0.4 + 0.6 * (1.0 - t)));
+    }
+    lin = max(lin, 0.0);
+  }
+
+  lin = max(u_wbMat * lin, 0.0);
   lin *= u_exposureGain;
-  float grayLin = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+
+  if (u_vibrance != 0.0) {
+    float mx = max(lin.r, max(lin.g, lin.b)), mn = min(lin.r, min(lin.g, lin.b));
+    float sat = mx > 0.0 ? (mx - mn) / mx : 0.0;
+    float skin = (lin.r >= lin.g && lin.g >= lin.b) ? 0.5 : 1.0;
+    float gain = 1.0 + u_vibrance * (1.0 - sat) * (1.0 - sat) * skin;
+    float grayV = dot(lin, LUMA);
+    lin = grayV + (lin - grayV) * gain;
+  }
+
+  float grayLin = dot(lin, LUMA);
   lin = grayLin + (lin - grayLin) * u_satGain;
+
+  if (useGuide && (u_hiStops != 0.0 || u_shStops != 0.0)) {
+    float base = max(1e-4, srgbToLinear1(gd.b) * u_exposureGain);
+    float lb2 = log2(base);
+    float stops = u_hiStops * smoothstepClamp(-2.5, 0.0, lb2) + u_shStops * (1.0 - smoothstepClamp(-6.5, -2.0, lb2));
+    lin *= exp2(stops);
+  }
+  if (u_shoulderKnee < 1.0) {
+    float y = dot(lin, LUMA);
+    float kn = u_shoulderKnee;
+    if (y > kn) lin *= (kn + (1.0 - kn) * (1.0 - exp(-(y - kn) / (1.0 - kn)))) / y;
+  }
 
   vec3 c = linearToSrgb(max(lin, 0.0));
 
+  if (u_pv >= 1.5) {
+    // pv 2 tail (colorAdjust.mjs finishPv2)
+    if (u_contrastS != 0.0) {
+      c = clamp(c, 0.0, 1.0);
+      c -= u_contrastS * sin(6.283185307 * c);
+    }
+    if (useGuide && (u_textureAmt != 0.0 || u_clarityAmt != 0.0)) c += detailShift(c, gd, lumIn);
+    if (u_whitesAmt != 0.0 || u_blacksAmt != 0.0) {
+      float lum = dot(c, LUMA);
+      c += u_whitesAmt * smoothstepClamp(0.45, 1.0, lum) + u_blacksAmt * (1.0 - smoothstepClamp(0.0, 0.55, lum));
+    }
+    gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+    return;
+  }
+
   c = (c - 0.5) * (1.0 + u_contrastAmt) + 0.5;
 
-  float lumH = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float lumH = dot(c, LUMA);
   float hd = smoothstepClamp(0.35, 1.0, lumH) * u_highlightGain;
   c += hd >= 0.0 ? hd * (1.0 - c) : hd * c;
-  float lumS = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float lumS = dot(c, LUMA);
   float sd = (1.0 - smoothstepClamp(0.0, 0.5, lumS)) * u_shadowGain;
   c += sd >= 0.0 ? sd * (1.0 - c) : sd * c;
+
+  if (useGuide && (u_textureAmt != 0.0 || u_clarityAmt != 0.0)) c += detailShift(c, gd, lumIn);
 
   float lo2 = u_blackShift, hi2 = 1.0 - u_whiteShift;
   c = (c - lo2) / max(0.05, hi2 - lo2);
 
   gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
+
+/* compileAdjust()'s white balance as the shader's mat3 (GLSL matrices are
+   column-major): pv 2's matrix transposed, or pv 1's gains on the diagonal. */
+function wbMatColumnMajor(c) {
+  const m = c.wbMat;
+  if (m) return new Float32Array([m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]]);
+  return new Float32Array([c.wbGainR, 0, 0, 0, c.wbGainG, 0, 0, 0, c.wbGainB]);
+}
 
 function compileGLShader(gl, type, src) {
   const sh = gl.createShader(type);
@@ -1510,6 +1929,7 @@ function mapStampToTexSpace(stamp, texRegion, texW) {
     dy: s.dy * s0,
     feather: s.feather,
     opacity: s.opacity,
+    mode: s.mode,
     points: s.points.map((p) => ({
       x: (p.x - texRegion.sx) * s0, y: (p.y - texRegion.sy) * s0,
       // per-dab offset override (see stampTool.mjs header) — a relative
@@ -1519,7 +1939,41 @@ function mapStampToTexSpace(stamp, texRegion, texW) {
   }));
 }
 
-function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRegion }) {
+/* Same as mapStampToTexSpace, for red-eye entries: the uploaded texture is
+   the UNROTATED original (CSS rotates it), so only translate + scale. */
+function mapRedEyeToTexSpace(redeye, texRegion, texW) {
+  if (isEmptyRedEye(redeye) || !texRegion || !texRegion.sw || !texW) return [];
+  const s0 = texW / texRegion.sw;
+  return mapRedEye(redeye, (x, y) => [(x - texRegion.sx) * s0, (y - texRegion.sy) * s0], 0, s0);
+}
+
+/* How long the composited texture has to sit unchanged before GLImage
+   recomputes its guide planes (colorAdjust.mjs computeGuides — hundreds
+   of ms at proxy size). Painting a stamp stroke re-uploads every frame;
+   recomputing on each of those would stall the brush, so the guides lag
+   slightly behind retouching instead (still correct for the image as a
+   whole, just not yet aware of the newest stroke for a moment). */
+const GUIDE_RECOMPUTE_DELAY = 350;
+
+/* Remove mode's local neural fill (MI-GAN, main process — see
+   electron/neuralFill.mjs and removeTool.mjs's hybrid). A GLImage
+   composite fills Remove strokes with PatchMatch right away and queues
+   neural jobs; this sends them over IPC and, as results land, asks EVERY
+   GLImage to recomposite (a job queued by the base image may be taken by
+   the deep-zoom tile's drain, or vice versa — the module queue is shared). */
+const neuralRedraws = new Set();
+function drainNeuralJobs() {
+  if (!NATIVE || !window.meridian?.neuralInpaint) return;
+  const jobs = takeNeuralJobs();
+  for (const j of jobs) {
+    window.meridian.neuralInpaint({ w: j.w, h: j.h, rgb: j.rgb, hole: j.hole, engine: j.engine })
+      .then((r) => putNeuralResult(j.key, r ? new Uint8Array(r) : null))
+      .catch(() => putNeuralResult(j.key, null))
+      .then(() => { for (const redraw of neuralRedraws) redraw(); });
+  }
+}
+
+function GLImage({ className, style, src, draggable, adjust, stamp, draft, redeye, texRegion, origDiag }) {
   const canvasRef = useRef(null);
   const glRef = useRef(null);
   const texRef = useRef(null);
@@ -1528,6 +1982,16 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
   adjustRef.current = adjust;
   const stampRef = useRef(stamp);
   stampRef.current = stamp;
+  const redeyeRef = useRef(redeye);
+  redeyeRef.current = redeye;
+  const origDiagRef = useRef(origDiag);
+  origDiagRef.current = origDiag;
+  // guide planes for the CURRENT composite: { version, airlight } once
+  // uploaded to guideTexRef; `compositeRef` is what they get computed from
+  const guideTexRef = useRef(null);
+  const guideRef = useRef(null);
+  const compositeRef = useRef(null); // { version, data, width, height, scale }
+  const guideTimerRef = useRef(0);
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const texRegionRef = useRef(texRegion);
@@ -1538,20 +2002,55 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
   const uploadTokenRef = useRef(0);
   const uploadRafRef = useRef(0);
 
+  /* Guide planes for the latest composite (see GUIDE_RECOMPUTE_DELAY).
+     Only ever runs when a guide-reading slider is actually in use — draw()
+     is what asks for it — so photos edited with per-pixel sliders only
+     never pay for it. */
+  const scheduleGuides = useCallback((delay) => {
+    clearTimeout(guideTimerRef.current);
+    guideTimerRef.current = setTimeout(() => {
+      const comp = compositeRef.current;
+      const g = glRef.current;
+      if (!comp || !g) return;
+      const guides = computeGuides(comp.data, comp.width, comp.height, 4, { scale: comp.scale, origDiag: origDiagRef.current });
+      const { gl } = g;
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, guideTexRef.current);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, guides.width, guides.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, guides.data);
+      gl.activeTexture(gl.TEXTURE0);
+      guideRef.current = { src: comp.src, version: comp.version, airlight: guides.airlight };
+      // via ref: scheduleDraw is defined below (and itself depends on draw,
+      // which depends on this)
+      if (redrawRef.current) redrawRef.current();
+    }, delay);
+  }, []);
+  const redrawRef = useRef(null);
+
   const draw = useCallback(() => {
     const g = glRef.current;
     const canvas = canvasRef.current;
     if (!g || !texRef.current || !canvas) return;
     const { gl } = g;
     const c = compileAdjust(adjustRef.current);
+    // guides: usable if they belong to this image (possibly one composite
+    // behind — see GUIDE_RECOMPUTE_DELAY); (re)computed on demand
+    const comp = compositeRef.current;
+    const gr = guideRef.current;
+    const wantGuides = needsGuides(c);
+    const useGuide = wantGuides && gr && comp && gr.src === comp.src;
+    if (wantGuides && comp && (!gr || gr.version !== comp.version)) {
+      scheduleGuides(gr && gr.src === comp.src ? GUIDE_RECOMPUTE_DELAY : 0);
+    }
     gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
     gl.useProgram(g.prog);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, guideTexRef.current);
+    gl.uniform1i(g.uGuide, 1);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texRef.current);
     gl.uniform1i(g.uTex, 0);
-    gl.uniform1f(g.uWbR, c.wbGainR);
-    gl.uniform1f(g.uWbG, c.wbGainG);
-    gl.uniform1f(g.uWbB, c.wbGainB);
+    gl.uniform1f(g.uUseGuide, useGuide ? 1 : 0);
+    gl.uniformMatrix3fv(g.uWbMat, false, wbMatColumnMajor(c));
     gl.uniform1f(g.uSat, c.satGain);
     gl.uniform1f(g.uExp, c.exposureGain);
     gl.uniform1f(g.uContrast, c.contrastAmt);
@@ -1559,8 +2058,20 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
     gl.uniform1f(g.uSh, c.shadowGain);
     gl.uniform1f(g.uWhite, c.whiteShift);
     gl.uniform1f(g.uBlack, c.blackShift);
+    gl.uniform1f(g.uPv, c.pv);
+    gl.uniform1f(g.uVibrance, c.vibrance);
+    gl.uniform1f(g.uTextureAmt, c.textureAmt);
+    gl.uniform1f(g.uClarityAmt, c.clarityAmt);
+    gl.uniform1f(g.uDehazeAmt, c.dehazeAmt);
+    gl.uniform1f(g.uAirlight, useGuide ? gr.airlight : 1);
+    gl.uniform1f(g.uShoulderKnee, c.shoulderKnee);
+    gl.uniform1f(g.uHiStops, c.hiStops);
+    gl.uniform1f(g.uShStops, c.shStops);
+    gl.uniform1f(g.uContrastS, c.contrastS);
+    gl.uniform1f(g.uWhitesAmt, c.whitesAmt);
+    gl.uniform1f(g.uBlacksAmt, c.blacksAmt);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  }, []);
+  }, [scheduleGuides]);
 
   const scheduleDraw = useCallback(() => {
     if (rafRef.current) return;
@@ -1569,6 +2080,7 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
       draw();
     });
   }, [draw]);
+  redrawRef.current = scheduleDraw;
 
   /* mount-once: WebGL context + program + fullscreen-quad + texture object */
   useEffect(() => {
@@ -1606,12 +2118,37 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
     texRef.current = tex;
 
+    // guide planes texture (unit 1) — starts as a 1×1 placeholder so the
+    // sampler is never unbound; u_useGuide gates every read of it
+    const guideTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, guideTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+    gl.activeTexture(gl.TEXTURE0);
+    guideTexRef.current = guideTex;
+
     glRef.current = {
       gl, prog,
       uTex: gl.getUniformLocation(prog, "u_tex"),
-      uWbR: gl.getUniformLocation(prog, "u_wbGainR"),
-      uWbG: gl.getUniformLocation(prog, "u_wbGainG"),
-      uWbB: gl.getUniformLocation(prog, "u_wbGainB"),
+      uGuide: gl.getUniformLocation(prog, "u_guide"),
+      uUseGuide: gl.getUniformLocation(prog, "u_useGuide"),
+      uPv: gl.getUniformLocation(prog, "u_pv"),
+      uVibrance: gl.getUniformLocation(prog, "u_vibrance"),
+      uTextureAmt: gl.getUniformLocation(prog, "u_textureAmt"),
+      uClarityAmt: gl.getUniformLocation(prog, "u_clarityAmt"),
+      uDehazeAmt: gl.getUniformLocation(prog, "u_dehazeAmt"),
+      uAirlight: gl.getUniformLocation(prog, "u_airlight"),
+      uShoulderKnee: gl.getUniformLocation(prog, "u_shoulderKnee"),
+      uHiStops: gl.getUniformLocation(prog, "u_hiStops"),
+      uShStops: gl.getUniformLocation(prog, "u_shStops"),
+      uContrastS: gl.getUniformLocation(prog, "u_contrastS"),
+      uWhitesAmt: gl.getUniformLocation(prog, "u_whitesAmt"),
+      uBlacksAmt: gl.getUniformLocation(prog, "u_blacksAmt"),
+      uWbMat: gl.getUniformLocation(prog, "u_wbMat"),
       uSat: gl.getUniformLocation(prog, "u_satGain"),
       uExp: gl.getUniformLocation(prog, "u_exposureGain"),
       uContrast: gl.getUniformLocation(prog, "u_contrastAmt"),
@@ -1626,6 +2163,8 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
       if (lose) lose.loseContext();
       glRef.current = null;
       texRef.current = null;
+      guideTexRef.current = null;
+      clearTimeout(guideTimerRef.current);
     };
   }, []);
 
@@ -1678,19 +2217,43 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
     // the two branches beginWindowDrag's onUp commits (see StampOverlay).
     const d = draftRef.current;
     let strokesForComposite = stampRef.current;
-    if (d && d.points && d.points.length) {
+    // a Remove stroke in progress is outline-only: its content-aware fill
+    // (electron/removeTool.mjs) runs once, when the stroke is committed —
+    // never per pointermove
+    const draftIsRemove = d && (d.isNew ? d.mode === "remove" : stampRef.current[d.index]?.mode === "remove");
+    if (d && d.points && d.points.length && !draftIsRemove) {
       strokesForComposite = d.isNew
-        ? [...strokesForComposite, { points: d.points, radius: d.radius, dx: d.dx, dy: d.dy, feather: d.feather, opacity: d.opacity }]
+        ? [...strokesForComposite, { points: d.points, radius: d.radius, dx: d.dx, dy: d.dy, feather: d.feather, opacity: d.opacity, mode: d.mode }]
         : strokesForComposite.map((s, i) => (i === d.index ? { ...s, points: [...s.points, ...d.points] } : s));
     }
     const texStamp = mapStampToTexSpace(strokesForComposite, texRegionRef.current, p.width);
-    if (texStamp.length) {
-      const composited = new Uint8ClampedArray(p.data);
-      applyStampToRGBBuffer(composited, p.width, p.height, 4, texStamp);
-      g.gl.texImage2D(g.gl.TEXTURE_2D, 0, g.gl.RGBA, p.width, p.height, 0, g.gl.RGBA, g.gl.UNSIGNED_BYTE, composited);
+    const texRedEye = mapRedEyeToTexSpace(redeyeRef.current, texRegionRef.current, p.width);
+    // same order as every bake path: stamp/heal → red eye → (color, in the shader)
+    let pixels = p.data;
+    if (texStamp.length || texRedEye.length) {
+      pixels = new Uint8ClampedArray(p.data);
+      if (texStamp.length) {
+        // queue neural jobs only for THIS on-screen composite (not for the
+        // histogram's or thumbnails' own small bakes) — see drainNeuralJobs
+        setNeuralEnabled(NATIVE && !!window.meridian?.neuralInpaint);
+        applyStampToRGBBuffer(pixels, p.width, p.height, 4, texStamp);
+        setNeuralEnabled(false);
+        drainNeuralJobs();
+      }
+      if (texRedEye.length) applyRedEyeToRGBBuffer(pixels, p.width, p.height, 4, texRedEye);
+      g.gl.texImage2D(g.gl.TEXTURE_2D, 0, g.gl.RGBA, p.width, p.height, 0, g.gl.RGBA, g.gl.UNSIGNED_BYTE, pixels);
     } else {
       g.gl.texImage2D(g.gl.TEXTURE_2D, 0, g.gl.RGBA, g.gl.RGBA, g.gl.UNSIGNED_BYTE, p.img);
     }
+    // what the guide planes get computed from (see scheduleGuides); version
+    // bumps on every upload so draw() knows the current guides are stale
+    const tr = texRegionRef.current;
+    compositeRef.current = {
+      src: p.src,
+      version: (compositeRef.current ? compositeRef.current.version : 0) + 1,
+      data: pixels, width: p.width, height: p.height,
+      scale: tr && tr.sw ? p.width / tr.sw : 1,
+    };
     scheduleDraw();
   }, [scheduleDraw]);
 
@@ -1711,6 +2274,11 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
       uploadTexture();
     });
   }, [uploadTexture]);
+
+  useEffect(() => {
+    neuralRedraws.add(scheduleUpload);
+    return () => { neuralRedraws.delete(scheduleUpload); };
+  }, [scheduleUpload]);
 
   /* Decode `src` into a pristine pixel buffer once per unique URL. */
   useEffect(() => {
@@ -1736,7 +2304,7 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
      comment above) is what keeps that from recompositing/re-uploading
      more than once per displayed frame, same as it already does for
      rapid stamp commits. */
-  useEffect(() => { scheduleUpload(); }, [stamp, draft, texRegion, scheduleUpload]);
+  useEffect(() => { scheduleUpload(); }, [stamp, draft, redeye, texRegion, scheduleUpload]);
 
   /* redraw (GPU-cheap: uniform update + one quad) on every adjust change */
   useEffect(() => { scheduleDraw(); }, [adjust, scheduleDraw]);
@@ -1749,6 +2317,23 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRe
   return <canvas ref={canvasRef} className={className} style={style} draggable={draggable} />;
 }
 
+const CLONE_OUTLINE = "rgba(130,215,255,.95)"; // unselected Clone stroke outline
+const HEAL_OUTLINE = "rgba(120,230,140,.95)";  // unselected Heal stroke outline
+const REMOVE_OUTLINE = "rgba(255,160,90,.95)";  // unselected Remove stroke outline
+const STAMP_MODES = ["clone", "heal", "remove"];
+const STAMP_MODE_LABEL = { clone: "Clone", heal: "Heal", remove: "Remove" };
+const svgTool = (children) => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{children}</svg>;
+const TOOL_ICON = {
+  crop: svgTool(<><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></>),
+  // "echo copy": the paint, with a fainter dashed duplicate behind it (the source)
+  clone: svgTool(<><circle cx="15" cy="9" r="5.3" strokeDasharray="2 2" opacity=".55"/><circle cx="10" cy="14" r="5.3"/></>),
+  heal: svgTool(<><rect x="2.6" y="8.4" width="18.8" height="7.2" rx="3.6" transform="rotate(-45 12 12)"/><path d="M10.6 10.6h.01M13.4 13.4h.01M10.6 13.4h.01M13.4 10.6h.01" strokeWidth="2.4"/></>),
+  remove: svgTool(<><path d="M8 20h12"/><path d="M5.3 14.7 13.6 6.4a2 2 0 0 1 2.8 0l3.2 3.2a2 2 0 0 1 0 2.8L12.4 19.6a1.4 1.4 0 0 1-1 .4H8.8a1.4 1.4 0 0 1-1-.4l-2.5-2.5a1.7 1.7 0 0 1 0-2.4z"/><path d="M9.5 10.5l4.9 4.9"/></>),
+  redeye: svgTool(<><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3" fill="currentColor"/></>),
+  wb: svgTool(<><path d="M14.5 4.5l5 5"/><path d="M17 7l2.6-2.6a1.9 1.9 0 0 0-2.7-2.7L14.3 4.3"/><path d="M15.5 8.5L6 18l-3 1 1-3 9.5-9.5"/></>),
+  trash: svgTool(<><path d="M4 7h16"/><path d="M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/><path d="M6.5 7l.9 12a1.2 1.2 0 0 0 1.2 1.1h6.8a1.2 1.2 0 0 0 1.2-1.1l.9-12"/></>),
+};
+const outlineFor = (mode) => (mode === "heal" ? HEAL_OUTLINE : mode === "remove" ? REMOVE_OUTLINE : CLONE_OUTLINE);
 const STAMP_SOURCE_OFFSET_MULT = 2.5; // default source distance, as a multiple of radius
 const STAMP_MIN_RADIUS = 3;           // image-px floor so a stroke never collapses to zero
 const STAMP_DAB_SPACING = 0.5;        // new dab emitted once the pointer has moved radius*this
@@ -2017,7 +2602,7 @@ function distToSegment(px, py, ax, ay, bx, by) {
   return Math.hypot(px - (ax + abx * t), py - (ay + aby * t));
 }
 
-function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef, spaceRef }) {
+function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef, spaceRef, stampMode }) {
   const screenToImage = useCallback((clientX, clientY) => {
     const box = stageRef.current.getBoundingClientRect();
     const sx = clientX - box.left, sy = clientY - box.top;
@@ -2208,6 +2793,21 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
     // single curved stroke can sample from itself.
     const otherStrokesObstacles = (excludeIndex) =>
       stamp.flatMap((s, i) => (i === excludeIndex ? [] : s.points.map((p) => ({ x: p.x, y: p.y, radius: s.radius }))));
+    // Heal has no user-chosen source: electron/stampTool.mjs findHealSource
+    // picks it from the photo (on the cached proxy buffer, then scaled back
+    // to original-image px). null if the buffer isn't decoded yet or nothing
+    // fits — callers keep whatever offset they already had.
+    const autoHealOffset = (points, radius, strokeFeatherVal, excludeIndex) => {
+      const px = editPixelsRef.current;
+      if (!px || !points.length) return null;
+      const s = px.scale;
+      const found = findHealSource(
+        px.data, px.width, px.height, 4,
+        points.map((p) => ({ x: p.x * s, y: p.y * s })), radius * s, strokeFeatherVal,
+        otherStrokesObstacles(excludeIndex).map((o) => ({ x: o.x * s, y: o.y * s, radius: o.radius * s })),
+      );
+      return found ? { dx: found.dx / s, dy: found.dy / s } : null;
+    };
 
     // strokeMeta (dx/dy/radius), obstacles (a plain mutable list of every
     // existing dab, own-stroke and other-strokes alike, updated in
@@ -2221,11 +2821,36 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
     // the meantime, so no cloned pixels appear and no source ring/handles
     // show until the stroke is actually finished.
     let index, isNew, last, strokeMeta, obstacles, preferred, newPoints, strokeFeather;
+    // fixed for the whole gesture (a mid-drag H press must not split a
+    // stroke into two modes); undefined = Clone, the stored default
+    const strokeMode = stampMode === "clone" ? undefined : stampMode;
+    // a NEW stroke follows the brush mode; continuing one keeps its own
+    let healStroke = strokeMode === "heal";
+    let removeStroke = strokeMode === "remove";
+    // heal: one automatic offset for the whole stroke, re-searched as it
+    // grows; remove: no source at all. Neither uses per-dab overrides —
+    // those exist for Clone's manual source.
+    const placeDab = (np) => {
+      if (healStroke || removeStroke) return np;
+      const result = pickDabOffset(strokeMeta, obstacles, np, preferred, editPixelsRef.current, iw, ih);
+      preferred = result;
+      const isNominal = Math.hypot(result.dx - strokeMeta.dx, result.dy - strokeMeta.dy) < 0.01;
+      return isNominal ? np : { ...np, dx: result.dx, dy: result.dy };
+    };
+    const allPoints = () => (isNew ? newPoints : [...stamp[index].points.map((p) => ({ x: p.x, y: p.y })), ...newPoints]);
+    const reHeal = () => {
+      if (!healStroke) return;
+      const o = autoHealOffset(allPoints(), strokeMeta.radius, strokeFeather, index);
+      if (o) strokeMeta = { ...strokeMeta, dx: o.dx, dy: o.dy };
+    };
     if (canContinue) {
       index = cont.index;
       isNew = false;
       last = cont.point;
       const existing = stamp[index];
+      healStroke = existing.mode === "heal";
+      removeStroke = existing.mode === "remove";
+      strokeFeather = existing.feather;
       strokeMeta = { dx: existing.dx, dy: existing.dy, radius: existing.radius };
       preferred = { angle: Math.atan2(strokeMeta.dy, strokeMeta.dx), distMult: 1 };
       obstacles = [
@@ -2236,15 +2861,12 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
       setSelectedStroke(index);
       const [cx, cy] = clampToImage(p0.x, p0.y);
       if (Math.hypot(cx - last.x, cy - last.y) >= brushRadius * STAMP_DAB_SPACING) {
-        const np = { x: cx, y: cy };
-        const result = pickDabOffset(strokeMeta, obstacles, np, preferred, editPixelsRef.current, iw, ih);
-        preferred = result;
-        const isNominal = Math.hypot(result.dx - strokeMeta.dx, result.dy - strokeMeta.dy) < 0.01;
-        const finalPoint = isNominal ? np : { ...np, dx: result.dx, dy: result.dy };
+        const finalPoint = placeDab({ x: cx, y: cy });
         last = { x: cx, y: cy };
         obstacles.push({ x: finalPoint.x, y: finalPoint.y, radius: strokeMeta.radius });
         newPoints = [finalPoint];
       }
+      reHeal();
       setDraft({ index, isNew: false, points: newPoints, radius: strokeMeta.radius, dx: strokeMeta.dx, dy: strokeMeta.dy });
     } else {
       setSelectedStroke(null);
@@ -2271,7 +2893,9 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
       strokeFeather = autoFeather(editPixelsRef.current, firstPoint, brushRadius, feather);
       newPoints = [firstPoint];
       last = firstPoint;
-      setDraft({ index, isNew: true, points: newPoints, radius: brushRadius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity });
+      if (removeStroke) strokeMeta = { ...strokeMeta, dx: 0, dy: 0 };
+      reHeal();
+      setDraft({ index, isNew: true, points: newPoints, radius: brushRadius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity, mode: strokeMode });
     }
 
     beginWindowDrag((ev) => {
@@ -2292,16 +2916,14 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
       for (let i = 1; i <= steps; i++) {
         const t = (i * spacing) / dist;
         const np = { x: last.x + (cx - last.x) * t, y: last.y + (cy - last.y) * t };
-        const result = pickDabOffset(strokeMeta, obstacles, np, preferred, editPixelsRef.current, iw, ih);
-        preferred = result;
-        const isNominal = Math.hypot(result.dx - strokeMeta.dx, result.dy - strokeMeta.dy) < 0.01;
-        const finalPoint = isNominal ? np : { ...np, dx: result.dx, dy: result.dy };
+        const finalPoint = placeDab(np);
         interpolated.push(finalPoint);
         obstacles.push({ x: finalPoint.x, y: finalPoint.y, radius: strokeMeta.radius });
       }
       last = { x: interpolated[interpolated.length - 1].x, y: interpolated[interpolated.length - 1].y };
       newPoints = [...newPoints, ...interpolated];
-      setDraft((d) => (d ? { ...d, points: newPoints } : d));
+      reHeal();
+      setDraft((d) => (d ? { ...d, points: newPoints, dx: strokeMeta.dx, dy: strokeMeta.dy } : d));
     }, () => {
       lastStrokeEndRef.current = { index, point: last, at: performance.now() };
       if (newPoints.length === 0) { setDraft(null); return; }
@@ -2311,14 +2933,15 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
         const room = MAX_STAMP_DABS - dabCount;
         const toAdd = newPoints.slice(0, Math.max(0, room));
         if (toAdd.length === 0) { setDraft(null); return; }
-        setStamp((prev) => [...prev, { points: toAdd, radius: strokeMeta.radius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity }]);
+        setStamp((prev) => [...prev, { points: toAdd, radius: strokeMeta.radius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity, ...(strokeMode ? { mode: strokeMode } : null) }]);
       } else {
         setStamp((prev) => {
           const dabCount = prev.reduce((n, s) => n + s.points.length, 0);
           const room = MAX_STAMP_DABS - dabCount;
           if (room <= 0) return prev;
           const toAdd = newPoints.slice(0, room);
-          return prev.map((s, i) => (i === index ? { ...s, points: [...s.points, ...toAdd] } : s));
+          // heal: the whole stroke's automatic source was re-searched (reHeal)
+          return prev.map((s, i) => (i === index ? { ...s, points: [...s.points, ...toAdd], ...(healStroke ? { dx: strokeMeta.dx, dy: strokeMeta.dy } : null) } : s));
         });
       }
       setSelectedStroke(index);
@@ -2423,14 +3046,15 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
           // tracing a pole/wire) look almost solid rather than hollow.
           const ringW = Math.max(1.25, Math.min(2.25, rPx * 0.05));
           // a plain white outline all but vanishes against a bright sky —
-          // a light cyan reads clearly against both light and dark content
-          const dstColor = isSel ? "#f3c34f" : "rgba(130,215,255,.95)";
+          // a light cyan reads clearly against both light and dark content;
+          // Heal strokes get green instead, so Clone vs Heal is visible at a glance
+          const dstColor = isSel ? "#f3c34f" : outlineFor(stroke.mode);
           const anchorLocal = imageToLocal(stroke.points[0].x, stroke.points[0].y);
           const srcAnchorLocal = isSel ? imageToLocal(stroke.points[0].x + stroke.dx, stroke.points[0].y + stroke.dy) : null;
           return (
             <g key={i}>
               {strokeRing(`stamp-dst-${i}`, stroke, 0, 0, rPx, ringW, dstColor)}
-              {isSel && (
+              {isSel && stroke.mode !== "heal" && stroke.mode !== "remove" && (
                 <>
                   {strokeRing(`stamp-src-${i}`, stroke, stroke.dx, stroke.dy, rPx, ringW, "#f3c34f")}
                   <line
@@ -2446,7 +3070,7 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
         {draft && draft.points.length > 0 && (() => {
           const rPx = draft.radius * view.k;
           const ringW = Math.max(1.25, Math.min(2.25, rPx * 0.05));
-          return <g key="stamp-draft">{strokeRing("stamp-draft", draft, 0, 0, rPx, ringW, "rgba(130,215,255,.95)")}</g>;
+          return <g key="stamp-draft">{strokeRing("stamp-draft", draft, 0, 0, rPx, ringW, outlineFor(draft.mode))}</g>;
         })()}
       </svg>
       {stamp.map((stroke, i) => {
@@ -2462,11 +3086,14 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
         const hitR = Math.max(rPx, STAMP_SRC_HIT_MIN);
         return (
           <div key={i}>
-            <div
-              className="stamp-hit src"
-              style={{ left: src.left - hitR, top: src.top - hitR, width: hitR * 2, height: hitR * 2 }}
-              onPointerDown={(e) => onHandleDown(e, i, "src")}
-            />
+            {/* Heal's source is automatic and Remove has none — nothing to grab */}
+            {stroke.mode !== "heal" && stroke.mode !== "remove" && (
+              <div
+                className="stamp-hit src"
+                style={{ left: src.left - hitR, top: src.top - hitR, width: hitR * 2, height: hitR * 2 }}
+                onPointerDown={(e) => onHandleDown(e, i, "src")}
+              />
+            )}
             <div
               className="stamp-handle"
               style={{ left: anchorLocal.left + rPx * Math.SQRT1_2 - 5, top: anchorLocal.top - rPx * Math.SQRT1_2 - 5 }}
@@ -2479,6 +3106,183 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
   );
 }
 
+/* ============================================================
+   White Balance Selector overlay (Lightroom's "W" eyedropper) — shown
+   over the photo while picking. A click samples the ORIGINAL pixels (the
+   cached proxy, editPixelsRef — the sliders are absolute, so the sample
+   must be the input, not the already-balanced preview) averaged over a
+   small square in linear light, and hands it to onPick. Space = hand
+   tool, Esc (Editor's key handler) cancels.
+   ============================================================ */
+const WB_SAMPLE_RADIUS = 2; // proxy px each side → a 5×5 average, steadier than one noisy pixel
+
+function WBPickOverlay({ view, iw, ih, stageRef, editPixelsRef, spaceRef, onPick, toast }) {
+  const onDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (spaceRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const b = stageRef.current.getBoundingClientRect();
+    const [ux, uy] = irot(e.clientX - b.left - view.icx, e.clientY - b.top - view.icy, rad(view.theta));
+    const x = ux / view.k + iw / 2, y = uy / view.k + ih / 2;
+    if (x < 0 || y < 0 || x >= iw || y >= ih) return;
+    const px = editPixelsRef.current;
+    if (!px) { toast("Still loading the photo — try again in a moment"); return; }
+    const cx = Math.round(x * px.scale), cy = Math.round(y * px.scale);
+    const lin = [0, 0, 0];
+    let n = 0;
+    for (let j = -WB_SAMPLE_RADIUS; j <= WB_SAMPLE_RADIUS; j++) {
+      for (let i = -WB_SAMPLE_RADIUS; i <= WB_SAMPLE_RADIUS; i++) {
+        const sx = cx + i, sy = cy + j;
+        if (sx < 0 || sy < 0 || sx >= px.width || sy >= px.height) continue;
+        const o = (sy * px.width + sx) * 4;
+        for (let c = 0; c < 3; c++) {
+          const v = px.data[o + c] / 255;
+          lin[c] += v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        }
+        n++;
+      }
+    }
+    if (!n) return;
+    // back to an sRGB byte triple (what neutralizeWhiteBalance expects)
+    const rgb = lin.map((v) => {
+      const l = v / n;
+      return 255 * (l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(l, 1 / 2.4) - 0.055);
+    });
+    onPick(rgb);
+  };
+  return <div className="wbpick-overlay" onPointerDown={onDown} />;
+}
+
+/* ============================================================
+   Red-eye overlay — rendered only in mode === "redeye". Drag a box
+   around an eye (or just click on it: a default-sized box is used) and
+   electron/redEyeTool.mjs's detectRedEye() finds the pupil inside it on
+   Editor's cached proxy buffer (editPixelsRef — same one StampOverlay
+   reads); the fitted ellipse is stored in original-image px. Click an
+   existing correction to select it (Size/Darken then edit it, Delete
+   removes it), double-click to remove. Space = hand tool, same as Stamp.
+   ============================================================ */
+const REDEYE_CLICK_BOX = 0.05;   // click without a drag: box side as a fraction of the image's short edge
+const REDEYE_DRAG_MIN_PX = 4;    // screen px of movement before a press counts as a box drag
+const REDEYE_OUTLINE_STEPS = 48;
+
+function RedEyeOverlay({ redeye, setRedEye, selectedEye, setSelectedEye, snapshot, view, rect, iw, ih, stageRef, toast, editPixelsRef, spaceRef, newSize, newDarken }) {
+  const [box, setBox] = useState(null); // in-progress drag, image px { x0, y0, x1, y1 }
+
+  const screenToImage = useCallback((clientX, clientY) => {
+    const b = stageRef.current.getBoundingClientRect();
+    const [ux, uy] = irot(clientX - b.left - view.icx, clientY - b.top - view.icy, rad(view.theta));
+    return { x: ux / view.k + iw / 2, y: uy / view.k + ih / 2 };
+  }, [view, iw, ih, stageRef]);
+  const imageToLocal = useCallback((x, y) => {
+    const [ox, oy] = rot(x - iw / 2, y - ih / 2, rad(view.theta));
+    return { left: view.icx + ox * view.k - rect.x, top: view.icy + oy * view.k - rect.y };
+  }, [view, iw, ih, rect]);
+
+  // which correction (if any) is under image point p — inside its drawn
+  // outline (pupil edge × size, plus a little slack for a thin pupil)
+  const hitEye = (p) => {
+    for (let i = redeye.length - 1; i >= 0; i--) {
+      const e = redeye[i];
+      const sx = e.sx * e.size, sy = e.sy * e.size;
+      const dx = (p.x - e.x) / sx, dy = (p.y - e.y) / sy;
+      const u = Math.sqrt((dx * dx - 2 * e.rho * dx * dy + dy * dy) / (1 - e.rho * e.rho)) / 2;
+      if (u <= 1.3) return i;
+    }
+    return -1;
+  };
+
+  const addFromBox = (b) => {
+    const px = editPixelsRef.current;
+    if (!px) { toast("Still loading the photo — try again in a moment"); return; }
+    const s = px.scale;
+    const found = detectRedEye(px.data, px.width, px.height, 4, { x0: b.x0 * s, y0: b.y0 * s, x1: b.x1 * s, y1: b.y1 * s });
+    if (!found) { toast("No red eye found there — drag a box around the whole eye"); return; }
+    snapshot();
+    setSelectedEye(redeye.length);
+    setRedEye((prev) => [...prev, { x: found.x / s, y: found.y / s, sx: found.sx / s, sy: found.sy / s, rho: found.rho, size: newSize, darken: newDarken }]);
+  };
+
+  const onDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (spaceRef.current) return; // hand tool: let it bubble to .stage's own pan-drag
+    e.preventDefault();
+    e.stopPropagation();
+    const p0 = screenToImage(e.clientX, e.clientY);
+    const hit = hitEye(p0);
+    if (hit !== -1) { setSelectedEye(hit); return; }
+    setSelectedEye(null);
+    const sx0 = e.clientX, sy0 = e.clientY;
+    let dragging = false;
+    const move = (ev) => {
+      if (!dragging && Math.hypot(ev.clientX - sx0, ev.clientY - sy0) < REDEYE_DRAG_MIN_PX) return;
+      dragging = true;
+      const p = screenToImage(ev.clientX, ev.clientY);
+      setBox({ x0: p0.x, y0: p0.y, x1: p.x, y1: p.y });
+    };
+    const up = (ev) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setBox(null);
+      if (dragging) {
+        const p = screenToImage(ev.clientX, ev.clientY);
+        addFromBox({ x0: Math.min(p0.x, p.x), y0: Math.min(p0.y, p.y), x1: Math.max(p0.x, p.x), y1: Math.max(p0.y, p.y) });
+      } else {
+        const h = (Math.min(iw, ih) * REDEYE_CLICK_BOX) / 2;
+        addFromBox({ x0: p0.x - h, y0: p0.y - h, x1: p0.x + h, y1: p0.y + h });
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  const onDouble = (e) => {
+    const hit = hitEye(screenToImage(e.clientX, e.clientY));
+    if (hit === -1) return;
+    e.stopPropagation(); // not a zoom-to-fit
+    snapshot();
+    setRedEye((prev) => prev.filter((_, i) => i !== hit));
+    setSelectedEye(null);
+  };
+
+  // ellipse outline: center + 2·size·L·(cos t, sin t), L = Cholesky factor
+  // of the stored covariance — so a tilted pupil draws tilted, and the
+  // image→screen mapping (incl. view rotation) is applied per point
+  const outline = (e) => {
+    const r = 2 * e.size;
+    const l11 = e.sx, l21 = e.rho * e.sy, l22 = e.sy * Math.sqrt(1 - e.rho * e.rho);
+    const pts = [];
+    for (let k = 0; k < REDEYE_OUTLINE_STEPS; k++) {
+      const t = (k / REDEYE_OUTLINE_STEPS) * Math.PI * 2;
+      const c = Math.cos(t), s = Math.sin(t);
+      const q = imageToLocal(e.x + r * l11 * c, e.y + r * (l21 * c + l22 * s));
+      pts.push(`${q.left},${q.top}`);
+    }
+    return pts.join(" ");
+  };
+
+  let boxEl = null;
+  if (box) {
+    const corners = [[box.x0, box.y0], [box.x1, box.y0], [box.x1, box.y1], [box.x0, box.y1]].map(([x, y]) => imageToLocal(x, y));
+    boxEl = <polygon points={corners.map((q) => `${q.left},${q.top}`).join(" ")} fill="none" stroke="#fff" strokeWidth="1.2" strokeDasharray="4 3" />;
+  }
+
+  return (
+    <div className="redeye-overlay" onPointerDown={onDown} onDoubleClick={onDouble}>
+      <svg className="stamp-svg">
+        {redeye.map((e, i) => (
+          <g key={i}>
+            <polygon points={outline(e)} fill="none" stroke="rgba(0,0,0,.55)" strokeWidth="3" />
+            <polygon points={outline(e)} fill="none" stroke={i === selectedEye ? "var(--accent)" : "#fff"} strokeWidth="1.4" />
+          </g>
+        ))}
+        {boxEl}
+      </svg>
+    </div>
+  );
+}
+
 function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport, filmstripHeight, onFilmstripResize }) {
   const stageRef = useRef(null);
   const [stage, setStage] = useState({ w: 0, h: 0 });
@@ -2486,10 +3290,55 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const [view, setView] = useState(null); // { icx, icy, k, theta }
   const [aspect, setAspect] = useState("free");
   const [flipped, setFlipped] = useState(false);
-  const [mode, setMode] = useState("view"); // 'view' = clean cropped photo, 'crop' = editing UI, 'stamp' = clone stamp
-  const [adjust, setAdjust] = useState(() => ({ ...defaultAdjust(), ...(photo.edits?.adjust || {}) }));
+  const [mode, setMode] = useState("view"); // 'view' = clean cropped photo, 'crop' = editing UI, 'stamp' = clone stamp / heal, 'redeye' = red-eye
+  // normalizeAdjust, not a bare spread over defaultAdjust(): an adjust saved
+  // before process versions must keep pv 1 (see colorAdjust.mjs)
+  const [adjust, setAdjust] = useState(() => normalizeAdjust(photo.edits?.adjust));
   const [stamp, setStamp] = useState(() => normalizeStamp(photo.edits?.stamp ?? photo.edits?.heal));
   const [selectedStroke, setSelectedStroke] = useState(null); // index into stamp, local-only (not persisted)
+  // red-eye corrections (electron/redEyeTool.mjs), original-image px
+  const [redeye, setRedEye] = useState(() => normalizeRedEye(photo.edits?.redeye));
+  const [selectedEye, setSelectedEye] = useState(null); // index into redeye, local-only
+  // new stamp strokes are Clone (raw copy), Heal (automatic source, re-
+  // toned) or Remove (content-aware fill, no source) — session-local brush
+  // setting like radius/feather; each stroke keeps its own mode
+  const [stampMode, setStampMode] = useState("clone");
+  /* Clone/Heal/Remove picker (toolbar chips and H). Always sets the BRUSH — what
+     every following stroke will be — and, when a stroke is selected, that
+     stroke too. Not "selected stroke only": painting auto-selects the
+     stroke just made, so a selected-only rule meant picking Heal after
+     the first dab silently converted that one stroke and every later
+     stroke stayed Clone (found in real use: not a single heal stroke had
+     been saved). */
+  const pickStampMode = (next) => {
+    setStampMode(next);
+    if (selectedStroke == null || !stamp[selectedStroke]) return;
+    if ((stamp[selectedStroke].mode || "clone") === next) return;
+    const heal = next === "heal";
+    snapshot();
+    // switching TO Heal also replaces the hand-picked source with an
+    // automatic one (Heal has no user source); back to Clone keeps it, so
+    // it's then draggable from where Heal had put it
+    let auto = null;
+    const px = editPixelsRef.current;
+    if (heal && px) {
+      const st = stamp[selectedStroke], k = px.scale;
+      const obstacles = stamp.flatMap((s, i) => (i === selectedStroke ? [] : s.points.map((p) => ({ x: p.x * k, y: p.y * k, radius: s.radius * k }))));
+      const f = findHealSource(px.data, px.width, px.height, 4, st.points.map((p) => ({ x: p.x * k, y: p.y * k })), st.radius * k, st.feather, obstacles);
+      if (f) auto = { dx: f.dx / k, dy: f.dy / k };
+    }
+    // Remove has no source at all; Clone keeps whatever offset the stroke had
+    const noSource = next === "remove" ? { dx: 0, dy: 0, points: stamp[selectedStroke].points.map((p) => ({ x: p.x, y: p.y })) } : null;
+    setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, mode: next === "clone" ? undefined : next, ...auto, ...noSource } : s)));
+  };
+  // Size/Darken for the NEXT red-eye correction (a selected one is edited
+  // directly instead — same split as the stamp's Feather/Opacity)
+  const [newEyeSize, setNewEyeSize] = useState(REDEYE_DEFAULT_SIZE);
+  // White Balance Selector (W): picking a neutral point on the photo
+  const [wbPicking, setWbPicking] = useState(false);
+  // right panel: Develop sliders or file Info
+  const [sideTab, setSideTab] = useState("develop");
+  const [newEyeDarken, setNewEyeDarken] = useState(REDEYE_DEFAULT_DARKEN);
   // The clone-stamp stroke currently being drawn/extended, while a drag is
   // still down — lifted up here (not local to StampOverlay) so GLImage can
   // fold it into its live composite too; see GLImage's uploadTexture and
@@ -2567,10 +3416,10 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const hist = useRef({ undo: [], redo: [] });
   const snapshot = useCallback(() => {
     if (!rect || !view) return;
-    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
+    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp], redeye: [...redeye] });
     if (hist.current.undo.length > 50) hist.current.undo.shift();
     hist.current.redo = [];
-  }, [rect, view, aspect, flipped, adjust, stamp]);
+  }, [rect, view, aspect, flipped, adjust, stamp, redeye]);
 
   const restoreSnap = useCallback((s) => {
     cancelFlip();
@@ -2581,22 +3430,24 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setFlipped(s.flipped);
     if (s.adjust) setAdjust(s.adjust);
     if (s.stamp) setStamp(s.stamp);
+    if (s.redeye) setRedEye(s.redeye);
     setSelectedStroke(null);
+    setSelectedEye(null);
   }, [cancelFlip]);
 
   const undo = useCallback(() => {
     const s = hist.current.undo.pop();
     if (!s || !rect || !view) return;
-    hist.current.redo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
+    hist.current.redo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp], redeye: [...redeye] });
     restoreSnap(s);
-  }, [rect, view, aspect, flipped, adjust, stamp, restoreSnap]);
+  }, [rect, view, aspect, flipped, adjust, stamp, redeye, restoreSnap]);
 
   const redo = useCallback(() => {
     const s = hist.current.redo.pop();
     if (!s || !rect || !view) return;
-    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
+    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp], redeye: [...redeye] });
     restoreSnap(s);
-  }, [rect, view, aspect, flipped, adjust, stamp, restoreSnap]);
+  }, [rect, view, aspect, flipped, adjust, stamp, redeye, restoreSnap]);
   const zoomBase = useRef(1);
   const drag = useRef(null);
   const refitTimer = useRef(null);
@@ -2686,11 +3537,12 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   }, [photo.id, photo.path]);
   // Decoding this is a full proxy-resolution canvas draw + getImageData (up
   // to 3200x3200, ~40MB) — real CPU/memory cost that's wasted on every
-  // single photo view if the user never opens Stamp. Gated on mode==="stamp"
-  // so it only pays for itself when actually needed; low-end-hardware win
-  // since most viewing is crop/develop, not retouching.
+  // single photo view if the user never opens Stamp. Gated on the retouch
+  // modes (stamp, and red-eye — whose pupil detection reads it too) so it
+  // only pays for itself when actually needed; low-end-hardware win since
+  // most viewing is crop/develop, not retouching.
   useEffect(() => {
-    if (mode !== "stamp") return;
+    if (mode !== "stamp" && mode !== "redeye" && !wbPicking) return;
     let alive = true;
     loadImage(proxyURL(photo)).then((img) => {
       if (!alive) return;
@@ -2705,7 +3557,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       };
     }).catch(() => {});
     return () => { alive = false; };
-  }, [photo.id, photo.path, iw, mode]);
+  }, [photo.id, photo.path, iw, mode, wbPicking]);
 
   // stable object identities (GLImage's redraw effect depends on texRegion)
   const baseTexRegion = useMemo(() => ({ sx: 0, sy: 0, sw: iw }), [iw]);
@@ -3362,6 +4214,8 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setAdjust(defaultAdjust());
     setStamp([]);
     setSelectedStroke(null);
+    setRedEye([]);
+    setSelectedEye(null);
     setDraft(null);
     const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
     const k = Math.min(availW / iw, availH / ih);
@@ -3390,11 +4244,12 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       Math.abs(e.theta) < 0.05 &&
       Math.abs(e.qcx) < 1 && Math.abs(e.qcy) < 1 &&
       e.cw > iw - 2 && e.ch > ih - 2;
-    if (isFull && isDefaultAdjust(adjust) && stamp.length === 0) return null;
+    if (isFull && isDefaultAdjust(adjust) && stamp.length === 0 && redeye.length === 0) return null;
     if (!isDefaultAdjust(adjust)) e.adjust = { ...adjust };
     if (stamp.length > 0) e.stamp = stamp;
+    if (redeye.length > 0) e.redeye = redeye;
     return e;
-  }, [rect, view, iw, ih, adjust, stamp]);
+  }, [rect, view, iw, ih, adjust, stamp, redeye]);
 
   // Same crop/rotate math as currentEdits() above, kept as its own memo
   // (deliberately NOT folding `adjust` in, unlike currentEdits) so the
@@ -3412,8 +4267,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       cw: Math.min(iw, rect.w / view.k),
       ch: Math.min(ih, rect.h / view.k),
       stamp,
+      redeye,
     };
-  }, [rect, view, iw, ih, stamp]);
+  }, [rect, view, iw, ih, stamp, redeye]);
 
   const buildEdits = async () => {
     const e = currentEdits();
@@ -3443,7 +4299,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     }, 500);
     return () => clearTimeout(autoCommitTimer.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjust, stamp]);
+  }, [adjust, stamp, redeye]);
 
   /* Done / Enter: apply the crop, hide the crop UI, show the clean result */
   const apply = async () => {
@@ -3463,6 +4319,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (mode === "crop" && rect && view) refit(rect, view, false);
     setMode("view");
     setDraft(null);
+    setSelectedEye(null);
     if (!e) toast("Restored to original");
   };
 
@@ -3504,6 +4361,8 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       // a slider keeps keyboard focus after a drag — Enter/Escape must still
       // act as confirm/cancel then, so only text-entry fields block them
       const inTextField = (tag === "INPUT" && ev.target.type !== "range") || tag === "TEXTAREA";
+      // Esc while picking white balance only cancels the picker
+      if (ev.key === "Escape" && wbPicking) { ev.preventDefault(); setWbPicking(false); return; }
       if (ev.key === "Enter" && !inTextField) { ev.preventDefault(); apply(); return; }
       if (ev.key === "Escape" && !inTextField) { ev.preventDefault(); exit(); return; }
       if (inTextField) return;
@@ -3561,11 +4420,34 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         ev.preventDefault();
         setMode("stamp");
       }
+      else if (ev.code === "KeyW" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        // White Balance Selector — over the finished view, like Lightroom's
+        // Develop W; from a retouch/crop mode it switches to view first
+        ev.preventDefault();
+        if (mode !== "view") setMode("view");
+        setWbPicking((p) => !p);
+      }
+      else if (ev.code === "KeyE" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        if (mode !== "view") return;
+        ev.preventDefault();
+        setMode("redeye");
+      }
+      else if (ev.code === "KeyH" && !ev.ctrlKey && !ev.metaKey && !ev.altKey && mode === "stamp") {
+        ev.preventDefault();
+        // H cycles Clone → Heal → Remove
+        pickStampMode(STAMP_MODES[(STAMP_MODES.indexOf(stampMode) + 1) % STAMP_MODES.length]);
+      }
       else if ((ev.key === "Delete" || ev.key === "Backspace") && mode === "stamp" && selectedStroke != null) {
         ev.preventDefault();
         snapshot();
         setStamp((prev) => prev.filter((_, i) => i !== selectedStroke));
         setSelectedStroke(null);
+      }
+      else if ((ev.key === "Delete" || ev.key === "Backspace") && mode === "redeye" && selectedEye != null) {
+        ev.preventDefault();
+        snapshot();
+        setRedEye((prev) => prev.filter((_, i) => i !== selectedEye));
+        setSelectedEye(null);
       }
       else if (/^Digit[0-5]$/.test(ev.code)) {
         const n = parseInt(ev.code.slice(5), 10);
@@ -3576,7 +4458,17 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo, selectedStroke, snapshot]);
+  }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo, selectedStroke, selectedEye, snapshot, stampMode, stamp, wbPicking]);
+
+  useEffect(() => { if (mode !== "view") setWbPicking(false); }, [mode]);
+
+  const pickWhiteBalance = (rgb) => {
+    const wb = neutralizeWhiteBalance(rgb, adjust.pv);
+    snapshot();
+    setAdjust({ ...adjust, temp: Math.round(wb.temp), tint: Math.round(wb.tint) });
+    setWbPicking(false);
+    toast(`White balance: Temperature ${Math.round(wb.temp) > 0 ? "+" : ""}${Math.round(wb.temp)}, Tint ${Math.round(wb.tint) > 0 ? "+" : ""}${Math.round(wb.tint)}`);
+  };
 
   const theta = view ? view.theta : 0;
   // Before/After: what GLImage actually renders — untouched adjust/stamp
@@ -3589,10 +4481,256 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   // currentEdits, the DevelopPanel sliders, …).
   const displayAdjust = compareBefore ? defaultAdjust() : adjust;
   const displayStamp = compareBefore ? EMPTY_STAMP : stamp;
+  const displayRedEye = compareBefore ? EMPTY_STAMP : redeye;
+  const origDiag = Math.hypot(iw, ih);
   const rot90Steps = Math.round(theta / 90);
   const fineTheta = Math.round((theta - rot90Steps * 90) * 10) / 10;
   const outW = rect && view ? Math.round(Math.min(iw, rect.w / view.k)) : 0;
   const outH = rect && view ? Math.round(Math.min(ih, rect.h / view.k)) : 0;
+
+  /* ---- tool rail (left of the canvas) ----
+     Same entry points as before: a tool starts only from view mode (what
+     the old topbar buttons / S / E did), clicking the active tool applies
+     it (= Done / Enter), Clone/Heal/Remove inside stamp mode switch the
+     brush mode exactly like the old chips (pickStampMode). Tools of
+     another mode are disabled until the current one is applied. */
+  const toggleWB = () => { if (mode !== "view") setMode("view"); setWbPicking((p) => !p); };
+  const railTool = (m, stampM) => {
+    if (mode === "view") {
+      if (stampM) setStampMode(stampM); // entering: just the brush mode for new strokes
+      setMode(m);
+      return;
+    }
+    if (mode !== m) return;
+    if (stampM && stampM !== stampMode) pickStampMode(stampM);
+    else apply();
+  };
+  const railBtn = (key, tip, pressed, onClick, disabled) => (
+    <Tip text={tip} side="right" key={key}>
+      <button className="tool" aria-pressed={pressed} aria-label={tip.split(" — ")[0]} onClick={onClick} disabled={disabled}>
+        {TOOL_ICON[key]}
+      </button>
+    </Tip>
+  );
+  const railUI = (
+    <div className="rail-dock">
+      <div className="rail glass">
+        {railBtn("crop", mode === "crop" ? "Apply crop (Enter)" : "Crop & straighten", mode === "crop", () => railTool("crop"), mode !== "view" && mode !== "crop")}
+        <div className="rail-sep" />
+        <div className={`rail-group ${mode === "stamp" ? "engaged" : ""}`}>
+          {railBtn("clone", "Clone (S) — exact copy of a source you place · H cycles modes", mode === "stamp" && stampMode === "clone", () => railTool("stamp", "clone"), mode !== "view" && mode !== "stamp")}
+          {railBtn("heal", "Heal — automatic source, blended into the surrounding tone · H cycles modes", mode === "stamp" && stampMode === "heal", () => railTool("stamp", "heal"), mode !== "view" && mode !== "stamp")}
+          {railBtn("remove", "Remove — content-aware fill, rebuilds the area from around it · H cycles modes", mode === "stamp" && stampMode === "remove", () => railTool("stamp", "remove"), mode !== "view" && mode !== "stamp")}
+        </div>
+        <div className="rail-sep" />
+        {railBtn("redeye", "Red eye (E)", mode === "redeye", () => railTool("redeye"), mode !== "view" && mode !== "redeye")}
+        {railBtn("wb", "White balance selector (W) — click something neutral gray or white", wbPicking, toggleWB, false)}
+      </div>
+    </div>
+  );
+
+  /* ---- HUD: the options of the active tool, docked under the photo ----
+     Every control is the same native input with the same handlers as the
+     old toolbelt rows; only the layout and drawing changed. */
+  const doneBtn = (
+    <button className="hud-done" onClick={apply}>Done <span className="kbd">⏎</span></button>
+  );
+  const brushMin = Math.max(2, Math.round(Math.min(iw, ih) * 0.0012));
+  const brushMax = Math.round(Math.min(iw, ih) * 0.15);
+  const selStroke = mode === "stamp" && selectedStroke != null ? stamp[selectedStroke] : null;
+  const curFeather = selStroke ? selStroke.feather : feather;
+  const curOpacity = selStroke ? selStroke.opacity : stampOpacity;
+  const prevSize = 8 + 22 * Math.sqrt(clamp((brushRadius - brushMin) / Math.max(1, brushMax - brushMin), 0, 1));
+  const hudField = (label, value, unit, sel, track, wide) => (
+    <div className={`hfield ${wide ? "wide" : ""}`}>
+      <div className="hf-head">
+        <span className="lab">{sel && <i className="sdot" />}{label}</span>
+        <span className="val">{value}{unit && <em>{unit}</em>}</span>
+      </div>
+      {track}
+    </div>
+  );
+  let hudUI = null;
+  if (mode === "stamp") {
+    const next = STAMP_MODES[(STAMP_MODES.indexOf(stampMode) + 1) % STAMP_MODES.length];
+    hudUI = (
+      <div className="hud glass">
+        <Tip text={`Switch to ${STAMP_MODE_LABEL[next]} (H)`}>
+          <button className="hud-chip" onClick={() => pickStampMode(next)}>
+            <span className="chip-ico">{TOOL_ICON[stampMode]}</span>
+            <span className="chip-text">
+              <span className="chip-name">{STAMP_MODE_LABEL[stampMode]}</span>
+              <span className="dots">{STAMP_MODES.map((m) => <i key={m} className={m === stampMode ? "on" : ""} />)}</span>
+            </span>
+          </button>
+        </Tip>
+        <div className="hsep" />
+        <div className="brush-prev">
+          <i style={{
+            width: prevSize, height: prevSize, opacity: 0.35 + 0.65 * curOpacity,
+            background: `radial-gradient(circle closest-side, var(--text) ${Math.round((1 - curFeather) * 100)}%, transparent 100%)`,
+          }} />
+        </div>
+        {hudField("Size", Math.round(brushRadius), "px", false,
+          <RangeTrack
+            min={brushMin} max={brushMax} step={1} value={brushRadius}
+            onChange={(e) => setBrushRadius(parseFloat(e.target.value))}
+          />)}
+        {hudField("Feather", Math.round(curFeather * 100), "%", !!selStroke,
+          <RangeTrack
+            min={0} max={80} step={1} value={Math.round(curFeather * 100)}
+            onPointerDown={snapshot}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value) / 100;
+              if (selectedStroke != null) {
+                setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, feather: v } : s)));
+              } else {
+                setFeather(v);
+              }
+            }}
+          />)}
+        {hudField("Opacity", Math.round(curOpacity * 100), "%", !!selStroke,
+          <RangeTrack
+            min={10} max={100} step={1} value={Math.round(curOpacity * 100)}
+            onPointerDown={snapshot}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value) / 100;
+              if (selectedStroke != null) {
+                setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, opacity: v } : s)));
+              } else {
+                setStampOpacity(v);
+              }
+            }}
+          />)}
+        {selStroke && (
+          <div className="selchip">
+            <i className="sdot" />{STAMP_MODE_LABEL[selStroke.mode || "clone"]} stroke
+            <Tip text="Delete stroke (Delete)">
+              <button
+                className="ib"
+                onClick={() => {
+                  snapshot();
+                  setStamp((prev) => prev.filter((_, i) => i !== selectedStroke));
+                  setSelectedStroke(null);
+                }}
+                aria-label="Delete stroke"
+              >
+                {TOOL_ICON.trash}
+              </button>
+            </Tip>
+            <Tip text="Deselect — Feather/Opacity go back to new strokes">
+              <button className="ib" onClick={() => setSelectedStroke(null)} aria-label="Deselect stroke">{I.close}</button>
+            </Tip>
+          </div>
+        )}
+        <div className="hsep" />
+        {doneBtn}
+      </div>
+    );
+  } else if (mode === "crop") {
+    hudUI = (
+      <div className="hud glass">
+        <div className="hud-chip">
+          <span className="chip-ico">{TOOL_ICON.crop}</span>
+          <span className="chip-name">Crop</span>
+        </div>
+        <div className="hsep" />
+        <div className="hud-seg">
+          {ASPECTS.map((a) => (
+            <button key={a.key} aria-pressed={aspect === a.key} onClick={() => pickAspect(a.key)}>
+              {flipped && a.v && a.v !== 1 ? swapLabel(a.label) : a.label}
+            </button>
+          ))}
+        </div>
+        <Tip text="Swap portrait / landscape">
+          <button
+            className="ib"
+            onClick={toggleFlip}
+            disabled={aspect === "1:1" || aspect === "free" || aspect === "orig"}
+            aria-pressed={flipped}
+            aria-label="Swap portrait / landscape"
+          >
+            {I.flip}
+          </button>
+        </Tip>
+        <Tip text="Rotate 90° left">
+          <button className="ib" onClick={() => rotate90(-1)} aria-label="Rotate 90° left">{I.rotateLeft}</button>
+        </Tip>
+        <Tip text="Rotate 90° right">
+          <button className="ib" onClick={() => rotate90(1)} aria-label="Rotate 90° right">{I.rotateRight}</button>
+        </Tip>
+        <div className="hsep" />
+        <div className="hfield wide">
+          <div className="hf-head">
+            <span className="lab">Straighten</span>
+            <span className={`val ${Math.abs(fineTheta) < 0.05 ? "zero" : ""}`}>{fineTheta > 0 ? "+" : ""}{fineTheta.toFixed(1)}°</span>
+          </div>
+          <RangeTrack
+            min={-45} max={45} step={0.1} origin={0}
+            value={fineTheta}
+            onPointerDown={snapshot}
+            onChange={(e) => applyRotation(rot90Steps * 90 + parseFloat(e.target.value))}
+            onDoubleClick={() => { snapshot(); applyRotation(rot90Steps * 90); }}
+          />
+        </div>
+        <div className="hsep" />
+        {doneBtn}
+      </div>
+    );
+  } else if (mode === "redeye") {
+    const sel = selectedEye != null ? redeye[selectedEye] : null;
+    hudUI = (
+      <div className="hud glass">
+        <div className="hud-chip">
+          <span className="chip-ico">{TOOL_ICON.redeye}</span>
+          <span className="chip-name">Red eye</span>
+        </div>
+        <div className="hsep" />
+        <div className="hud-hint">
+          {redeye.length === 0
+            ? "Drag a box around a red eye, or click on it"
+            : "Drag around another eye · click one to select · Delete removes it"}
+        </div>
+        {[
+          { key: "size", label: "Pupil size", min: 50, max: 200, value: newEyeSize, set: setNewEyeSize },
+          { key: "darken", label: "Darken", min: 0, max: 100, value: newEyeDarken, set: setNewEyeDarken },
+        ].map((f) => {
+          const v = sel ? sel[f.key] : f.value;
+          return (
+            <div key={f.key} style={{ display: "contents" }}>
+              {hudField(f.label, Math.round(v * 100), "%", !!sel,
+                <RangeTrack
+                  min={f.min} max={f.max} step={1} value={Math.round(v * 100)}
+                  onPointerDown={sel ? snapshot : undefined}
+                  onChange={(e) => {
+                    const nv = parseFloat(e.target.value) / 100;
+                    if (sel) setRedEye((prev) => prev.map((x, i) => (i === selectedEye ? { ...x, [f.key]: nv } : x)));
+                    else f.set(nv);
+                  }}
+                />)}
+            </div>
+          );
+        })}
+        <div className="hsep" />
+        {doneBtn}
+      </div>
+    );
+  }
+  // White balance picking happens over the finished view: its HUD floats
+  // over the canvas instead of docking, so the stage never resizes (a
+  // resize there would re-fit the zoom the user is picking at)
+  const wbHud = mode === "view" && wbPicking && (
+    <div className="hud glass hud-float">
+      <div className="hud-chip">
+        <span className="chip-ico">{TOOL_ICON.wb}</span>
+        <span className="chip-name">White balance</span>
+      </div>
+      <div className="hsep" />
+      <div className="hud-hint">Click something that should be neutral gray or white</div>
+      <button className="hud-btn" onClick={() => setWbPicking(false)}>Cancel <span className="kbd">Esc</span></button>
+    </div>
+  );
+  const folderName = (photo.folder || "").split(/[\\/]/).filter(Boolean).pop();
 
   return (
     <div className="editor">
@@ -3600,12 +4738,13 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         <Tip text="Back to Library">
           <button className="btn ghost icon" onClick={exit} aria-label="Back to Library">{I.back}</button>
         </Tip>
-        <div style={{ color: "var(--muted)", fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {photo.name}
+        <div className="crumbs">
+          {folderName && <><span className="roll">{folderName}</span><span className="sep">/</span></>}
+          <span className="file">{photo.name}</span>
         </div>
         <div className="spacer" />
         {busyExport && <div className="topbar-progress">{busyExport}</div>}
-        {(!isDefaultAdjust(adjust) || stamp.length > 0) && (
+        {(!isDefaultAdjust(adjust) || stamp.length > 0 || redeye.length > 0) && (
           <Tip text="Hold to compare with the original (\)">
             <button
               className={`btn ghost icon ${compareBefore ? "active" : ""}`}
@@ -3619,34 +4758,17 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             </button>
           </Tip>
         )}
-        {mode === "view" ? (
-          <>
-            <Tip text="Crop">
-              <button className="btn ghost icon" onClick={() => setMode("crop")} aria-label="Crop">
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
-              </button>
-            </Tip>
-            <Tip text="Clone stamp (S)">
-              <button className="btn ghost icon" onClick={() => setMode("stamp")} aria-label="Clone stamp">
-                {/* "echo copy": a solid circle (the paint) with a fainter dashed
-                    duplicate offset behind it (the source) — reads as "this is
-                    a copy of that" rather than a literal stamp-the-object
-                    silhouette, which tested poorly at this size. */}
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="15" cy="9" r="5.3" strokeDasharray="2 2" opacity=".55"/><circle cx="10" cy="14" r="5.3"/></svg>
-              </button>
-            </Tip>
-          </>
-        ) : (
-          <Tip text="Apply (Enter)">
-            <button className="btn ghost icon" onClick={apply} aria-label="Apply">{I.done}</button>
-          </Tip>
-        )}
         <Tip text="Reset all edits">
           <button className="btn ghost icon" onClick={reset} aria-label="Reset all edits">{I.reset}</button>
         </Tip>
+        <Tip text={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}>
+          <button className="btn ghost icon" onClick={onToggleTheme} aria-label="Toggle theme">
+            {theme === "dark" ? I.sun : I.moon}
+          </button>
+        </Tip>
         <Tip text={selected && selected.size > 0 ? `Export ${selected.size} selected photos` : "Export this photo"}>
           <button
-            className="btn ghost icon"
+            className="btn-export"
             onClick={async () => {
               // commit live edits (crop + adjust + stamp) first — otherwise a
               // tweak made without hitting Done/Enter first gets left behind.
@@ -3660,17 +4782,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             }}
             aria-label="Export"
           >
-            {I.export}
-          </button>
-        </Tip>
-        <Tip text={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}>
-          <button className="btn ghost icon" onClick={onToggleTheme} aria-label="Toggle theme">
-            {theme === "dark" ? I.sun : I.moon}
+            {I.export}Export
           </button>
         </Tip>
       </div>
 
       <div className="ed-body">
+      {railUI}
+      <div className="workspace">
       <div
         className="stage"
         ref={stageRef}
@@ -3703,21 +4822,23 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               transform: `translate(${view.icx - iw / 2}px, ${view.icy - ih / 2}px) rotate(${theta}deg) scale(${view.k})`,
             }}
           >
-            <GLImage className="base" src={editSrcURL(photo)} adjust={displayAdjust} stamp={displayStamp} texRegion={baseTexRegion} draggable={false} />
+            <GLImage className="base" src={editSrcURL(photo)} adjust={displayAdjust} stamp={displayStamp} redeye={displayRedEye} texRegion={baseTexRegion} origDiag={origDiag} draggable={false} />
             {tile && (
               <GLImage
                 className="tileimg"
                 src={tile.url}
                 adjust={displayAdjust}
                 stamp={displayStamp}
+                redeye={displayRedEye}
                 texRegion={tileTexRegion}
+                origDiag={origDiag}
                 draggable={false}
                 style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
               />
             )}
           </div>
         )}
-        {rect && view && (mode === "view" || mode === "stamp") && (
+        {rect && view && (mode === "view" || mode === "stamp" || mode === "redeye") && (
           <div
             className="viewclip"
             style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
@@ -3735,7 +4856,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 adjust={displayAdjust}
                 stamp={displayStamp}
                 draft={mode === "stamp" && !compareBefore ? draft : null}
+                redeye={displayRedEye}
                 texRegion={baseTexRegion}
+                origDiag={origDiag}
                 draggable={false}
               />
               {tile && (
@@ -3745,7 +4868,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                   adjust={displayAdjust}
                   stamp={displayStamp}
                   draft={mode === "stamp" && !compareBefore ? draft : null}
+                  redeye={displayRedEye}
                   texRegion={tileTexRegion}
+                  origDiag={origDiag}
                   draggable={false}
                   style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
                 />
@@ -3772,6 +4897,38 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 gesturing={gesturing}
                 editPixelsRef={editPixelsRef}
                 spaceRef={spaceRef}
+                stampMode={stampMode}
+              />
+            )}
+            {mode === "view" && wbPicking && (
+              <WBPickOverlay
+                view={view}
+                iw={iw}
+                ih={ih}
+                stageRef={stageRef}
+                editPixelsRef={editPixelsRef}
+                spaceRef={spaceRef}
+                onPick={pickWhiteBalance}
+                toast={toast}
+              />
+            )}
+            {mode === "redeye" && (
+              <RedEyeOverlay
+                redeye={redeye}
+                setRedEye={setRedEye}
+                selectedEye={selectedEye}
+                setSelectedEye={setSelectedEye}
+                snapshot={snapshot}
+                view={view}
+                rect={rect}
+                iw={iw}
+                ih={ih}
+                stageRef={stageRef}
+                toast={toast}
+                editPixelsRef={editPixelsRef}
+                spaceRef={spaceRef}
+                newSize={newEyeSize}
+                newDarken={newEyeDarken}
               />
             )}
           </div>
@@ -3815,133 +4972,25 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         )}
         </div>
       </div>
+      {hudUI && <div className="hud-dock">{hudUI}</div>}
+      {wbHud}
+      </div>
       <div className="meta">
-        <DevelopPanel photo={photo} iw={iw} ih={ih} crop={histCrop} adjust={adjust} onAdjustChange={setAdjust} onSliderStart={snapshot} />
-        <MetaPanel photo={photo} outW={outW} outH={outH} theta={theta} exif={exif} />
+        <div className="side-tabs" role="tablist">
+          <button role="tab" aria-selected={sideTab === "develop"} onClick={() => setSideTab("develop")}>Develop</button>
+          <button role="tab" aria-selected={sideTab === "info"} onClick={() => setSideTab("info")}>Info</button>
+        </div>
+        {sideTab === "develop" ? (
+          <DevelopPanel
+            photo={photo} iw={iw} ih={ih} crop={histCrop} adjust={adjust} onAdjustChange={setAdjust} onSliderStart={snapshot}
+            wbPicking={wbPicking}
+            onToggleWBPick={toggleWB}
+          />
+        ) : (
+          <MetaPanel photo={photo} outW={outW} outH={outH} theta={theta} exif={exif} />
+        )}
       </div>
       </div>
-
-      {mode === "crop" && (
-      <div className="toolbelt">
-        <div className="aspects">
-          {ASPECTS.map((a) => (
-            <button key={a.key} className={`chip ${aspect === a.key ? "on" : ""}`} onClick={() => pickAspect(a.key)}>
-              {flipped && a.v && a.v !== 1 ? swapLabel(a.label) : a.label}
-            </button>
-          ))}
-          <Tip text="Swap portrait / landscape">
-            <button
-              className="chip icon"
-              onClick={toggleFlip}
-              disabled={aspect === "1:1" || aspect === "free" || aspect === "orig"}
-              style={flipped ? { color: "var(--accent)", borderColor: "var(--accent)" } : undefined}
-              aria-label="Swap portrait / landscape"
-            >
-              {I.flip}
-            </button>
-          </Tip>
-          <Tip text="Rotate 90° left">
-            <button className="chip icon" onClick={() => rotate90(-1)} aria-label="Rotate 90° left">
-              {I.rotateLeft}
-            </button>
-          </Tip>
-          <Tip text="Rotate 90° right">
-            <button className="chip icon" onClick={() => rotate90(1)} aria-label="Rotate 90° right">
-              {I.rotateRight}
-            </button>
-          </Tip>
-        </div>
-        <div className="rot-row">
-          <div className="rot-slider">
-            <div className="notch" />
-            <input
-              type="range" className="rot" min={-45} max={45} step={0.1}
-              value={fineTheta}
-              onPointerDown={snapshot}
-              onChange={(e) => applyRotation(rot90Steps * 90 + parseFloat(e.target.value))}
-              onDoubleClick={() => { snapshot(); applyRotation(rot90Steps * 90); }}
-            />
-          </div>
-          <div className={`degree ${Math.abs(fineTheta) < 0.05 ? "zero" : ""}`}>
-            {fineTheta > 0 ? "+" : ""}{fineTheta.toFixed(1)}°
-          </div>
-        </div>
-      </div>
-      )}
-
-      {mode === "stamp" && (
-      <div className="toolbelt">
-        <div className="rot-row">
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>Brush size</span>
-          <div className="rot-slider">
-            <input
-              type="range"
-              className="rot"
-              min={Math.max(2, Math.round(Math.min(iw, ih) * 0.0012))}
-              max={Math.round(Math.min(iw, ih) * 0.15)}
-              step={1}
-              value={brushRadius}
-              onChange={(e) => setBrushRadius(parseFloat(e.target.value))}
-            />
-          </div>
-          <div className="degree">{Math.round(brushRadius)}px</div>
-        </div>
-        <div className="rot-row">
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>
-            Feather{selectedStroke != null ? " (selected)" : ""}
-          </span>
-          <div className="rot-slider">
-            <input
-              type="range"
-              className="rot"
-              min={0}
-              max={80}
-              step={1}
-              value={Math.round((selectedStroke != null ? stamp[selectedStroke].feather : feather) * 100)}
-              onPointerDown={snapshot}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value) / 100;
-                if (selectedStroke != null) {
-                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, feather: v } : s)));
-                } else {
-                  setFeather(v);
-                }
-              }}
-            />
-          </div>
-          <div className="degree">
-            {Math.round((selectedStroke != null ? stamp[selectedStroke].feather : feather) * 100)}%
-          </div>
-        </div>
-        <div className="rot-row">
-          <span style={{ color: "var(--muted)", fontSize: 13 }}>
-            Opacity{selectedStroke != null ? " (selected)" : ""}
-          </span>
-          <div className="rot-slider">
-            <input
-              type="range"
-              className="rot"
-              min={10}
-              max={100}
-              step={1}
-              value={Math.round((selectedStroke != null ? stamp[selectedStroke].opacity : stampOpacity) * 100)}
-              onPointerDown={snapshot}
-              onChange={(e) => {
-                const v = parseFloat(e.target.value) / 100;
-                if (selectedStroke != null) {
-                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, opacity: v } : s)));
-                } else {
-                  setStampOpacity(v);
-                }
-              }}
-            />
-          </div>
-          <div className="degree">
-            {Math.round((selectedStroke != null ? stamp[selectedStroke].opacity : stampOpacity) * 100)}%
-          </div>
-        </div>
-      </div>
-      )}
 
       {siblings && siblings.length >= 2 && (
         <>

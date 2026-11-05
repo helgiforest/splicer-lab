@@ -33,6 +33,47 @@ function getStampTool() {
   return stampToolP;
 }
 
+/* redEyeTool.mjs — same ESM/dynamic-import rationale as colorAdjust.mjs */
+let redEyeToolP = null;
+function getRedEyeTool() {
+  if (!redEyeToolP) redEyeToolP = import(pathToFileURL(path.join(__dirname, "redEyeTool.mjs")).href);
+  return redEyeToolP;
+}
+
+/* removeTool.mjs (Remove mode's fill + neural job queue — the SAME module
+   instance stampTool.mjs imports, so jobs queued while compositing are
+   visible here) and neuralFill.mjs (MI-GAN on onnxruntime-web, local) —
+   same ESM/dynamic-import rationale as colorAdjust.mjs */
+let removeToolP = null;
+function getRemoveTool() {
+  if (!removeToolP) removeToolP = import(pathToFileURL(path.join(__dirname, "removeTool.mjs")).href);
+  return removeToolP;
+}
+let neuralFillP = null;
+function getNeuralFill() {
+  if (!neuralFillP) neuralFillP = import(pathToFileURL(path.join(__dirname, "neuralFill.mjs")).href);
+  return neuralFillP;
+}
+
+/* Runs every queued Remove-mode neural job (see removeTool.mjs) and stores
+   the results; returns how many ran. A failed inference is logged and
+   leaves that stroke on its PatchMatch-only fill. */
+async function runNeuralJobs() {
+  const { takeNeuralJobs, putNeuralResult } = await getRemoveTool();
+  const jobs = takeNeuralJobs();
+  if (!jobs.length) return 0;
+  const { neuralInpaint } = await getNeuralFill();
+  for (const j of jobs) {
+    try {
+      putNeuralResult(j.key, await neuralInpaint(j.rgb, j.hole, j.w, j.h, j.engine));
+    } catch (err) {
+      putNeuralResult(j.key, null);
+      appendLog(`[main] neural inpaint failed: ${err?.stack || err}`);
+    }
+  }
+  return jobs.length;
+}
+
 /* ---------------- file logging ----------------
    One plain-text file per day under userData/logs, so a bug report can
    include a log file instead of a DevTools screenshot. Covers main-process
@@ -685,7 +726,23 @@ async function bakeRaw(item, scalePct) {
   const stampData = e && (e.stamp || e.heal);
   if (stampData && stampData.length) {
     const { applyStampToRGBBuffer } = await getStampTool();
+    const hasRemove = stampData.some((s) => s && s.mode === "remove");
+    // Remove strokes: first pass queues their neural jobs (and fills with
+    // PatchMatch); run those, then composite again from the untouched
+    // pixels so every Remove stroke gets its neural+PatchMatch hybrid
+    const pristine = hasRemove ? Buffer.from(oriented.data) : null;
+    if (hasRemove) (await getRemoveTool()).setNeuralEnabled(true);
     applyStampToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, stampData);
+    if (hasRemove && (await runNeuralJobs()) > 0) {
+      pristine.copy(oriented.data);
+      applyStampToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, stampData);
+    }
+  }
+  // red eye: same frame as the stamp (original-image px, EXIF-oriented,
+  // pre-rotate/crop), so stored entries apply as-is — no mapping needed
+  if (e && e.redeye && e.redeye.length) {
+    const { applyRedEyeToRGBBuffer } = await getRedEyeTool();
+    applyRedEyeToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, e.redeye);
   }
   let base = oriented;
   let cw = base.info.width, ch = base.info.height, cx = cw / 2, cy = ch / 2;
@@ -719,7 +776,13 @@ async function bakeRaw(item, scalePct) {
   const rawObj = await pipe.raw().toBuffer({ resolveWithObject: true });
   if (e && e.adjust) {
     const { applyAdjustToRGBBuffer } = await getColorAdjust();
-    applyAdjustToRGBBuffer(rawObj.data, rawObj.info.width, rawObj.info.height, rawObj.info.channels, e.adjust);
+    // scale/origDiag: local sliders (Texture/Clarity/Dehaze, pv-2
+    // Highlights/Shadows) size their filters off the ORIGINAL image, so the
+    // export filters the same physical area the proxy preview did
+    applyAdjustToRGBBuffer(rawObj.data, rawObj.info.width, rawObj.info.height, rawObj.info.channels, e.adjust, {
+      scale: rawObj.info.width / cw,
+      origDiag: Math.hypot(oriented.info.width, oriented.info.height),
+    });
   }
   return rawObj;
 }
@@ -773,6 +836,19 @@ function bakeCached(item, scalePct) {
 /* deep-zoom tile: exact visible region of the ORIENTED original at the
    requested pixel density — snaps the proxy view to pixel sharpness */
 let tileGen = 0;
+/* renderer → main: one Remove-mode neural job (see removeTool.mjs /
+   GLImage). job = { w, h, rgb: Uint8Array w·h·3, hole: Uint8Array w·h,
+   engine: "migan" | "lama" } */
+ipcMain.handle("neural-inpaint", async (_e, job) => {
+  try {
+    const { neuralInpaint } = await getNeuralFill();
+    return await neuralInpaint(job.rgb, job.hole, job.w, job.h, job.engine);
+  } catch (err) {
+    appendLog(`[main] neural inpaint failed: ${err?.stack || err}`);
+    return null;
+  }
+});
+
 ipcMain.handle("render-tile", async (_e, p, t) => {
   if (!isAllowedPath(p)) return null;
   const myGen = ++tileGen;

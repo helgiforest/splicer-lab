@@ -125,10 +125,58 @@
    change, rather than rendering each stroke independently, so the
    live preview can never show a stroke sourcing from since-edited
    pixels as if they were still untouched.
+
+   HEAL strokes (`mode: "heal"`) — a SEPARATE, opt-in stroke mode, not a
+   change to Clone. Everything above about Clone (raw 1:1 copy, no
+   automatic correction) still holds for every stroke without
+   `mode: "heal"`; the user deliberately keeps that. A heal stroke has NO
+   user-chosen source: its single (dx, dy) is found automatically
+   (findHealSource, below) and per-point offset overrides are ignored.
+   It shares the rest of Clone's geometry (capsule footprint, dithered
+   feather, opacity, read-before-write snapshot) and only changes WHAT gets
+   written inside the footprint: the source TEXTURE, re-toned to match the
+   destination's surroundings — the classic "healing brush" idea
+   (Georgiev, "Photoshop Healing Brush: a tool for seamless cloning",
+   2004), done here with these specific, deliberately conservative choices:
+
+   - Work in a SQRT domain per channel (v = sqrt(byte/255)), not on raw
+     bytes and not in log: a perceptually-even-ish space where an additive
+     correction behaves like a brightness ratio in the highlights and like
+     an offset in the shadows, and that (unlike log) is defined at 0. The
+     result is squared back, so it can never go negative.
+   - Correction field δ = v(destination) − v(source), measured only on a
+     thin RING just outside the footprint (where the destination is the
+     real, untouched surroundings — see feedback_ring_sampling_median.md's
+     throughline: the destination's target tone must come from what the
+     footprint is NOT). Ring samples whose δ is an outlier (beyond
+     HEAL_OUTLIER_K robust deviations from the ring's median) are dropped —
+     the wire/pole-crossing-the-ring case that once left ghosts behind.
+   - δ is then interpolated INTO the footprint as a smooth membrane:
+     a push-pull pyramid (normalized-convolution downsample, blended
+     upsample — Gortler et al., "The Lumigraph", 1996) for a fast global
+     estimate, refined by plain Gauss-Seidel averaging sweeps (no
+     over-relaxation). Both steps only ever take weighted AVERAGES of
+     existing ring values, so by the discrete maximum principle every
+     interpolated δ stays within the ring's own [min, max] — there is no
+     way for this to overshoot into the corrupted/"rainbow" output the old
+     SOR Poisson attempt produced on dense dab clusters
+     (feedback_stamp_poisson_blend.md). Worst case it's a soft, wrong tone,
+     never noise.
+   - Output = (v(source) + δ)², composited through the same dithered
+     feather + opacity as Clone. The source's own grain is untouched (δ is
+     smooth), so the texture-preservation reasoning above still applies.
    ============================================================ */
+
+import { removeFill } from "./removeTool.mjs";
 
 const DEFAULT_FEATHER = 0.3;      // default feather zone width, as a fraction of radius (Photoshop's brush "hardness", inverted)
 const DEFAULT_OPACITY = 1;        // default strength — 1 = fully replace, less = blend with the original (Photoshop's Opacity/Flow)
+const HEAL_RING_FRAC = 0.15;      // heal: boundary ring width, as a fraction of radius...
+const HEAL_RING_MIN = 2;          // ...but never thinner than this many px
+const HEAL_OUTLIER_K = 3;         // heal: ring δ further than this × robust spread (1.4826·MAD) from the median is dropped
+const HEAL_OUTLIER_FLOOR = 0.02;  // heal: spread floor (sqrt-domain units) so a near-uniform ring doesn't reject ordinary grain
+const HEAL_SWEEPS = 30;           // heal: Gauss-Seidel refinement sweeps after the push-pull estimate
+const HEAL_RING_SMOOTH = 0.5;    // heal: ring δ is averaged along the ring over ± this × radius (see healSource)
 
 export function isEmptyStamp(stamp) {
   return !stamp || stamp.length === 0;
@@ -218,6 +266,203 @@ function closestOnSegment(px, py, ax, ay, bx, by) {
   return { x: ax + abx * t, y: ay + aby * t, t };
 }
 
+function median(arr) {
+  const s = Float32Array.from(arr).sort();
+  const n = s.length;
+  return n === 0 ? 0 : n % 2 ? s[(n - 1) / 2] : 0.5 * (s[n / 2 - 1] + s[n / 2]);
+}
+
+/* Heal stroke's re-toned source colors — see the module header's HEAL
+   section for the why. `best` is the stroke's footprint (pixel key →
+   {dist, dx, dy}) extended out to the boundary ring; `snap` the stroke's
+   read-before-write snapshot. Returns { get(key) → [r, g, b] } (0-255
+   floats) for every footprint pixel (dist ≤ outer).
+
+   Everything runs on a dense grid over the footprint's bounding box — the
+   pyramid and the sweeps need neighbors. Grid cells: 1 = footprint (δ
+   unknown, solved for), 2 = boundary ring (δ measured, fixed), 3 = ring
+   sample rejected as an outlier (solved for, like the footprint), 0 = not
+   part of the domain (outside the stroke, or off the buffer — treated as
+   "no neighbor", i.e. the membrane simply doesn't see it). */
+function healSource(best, snap, rx0, ry0, rw, rh, width, outer, ringR) {
+  let gx0 = Infinity, gy0 = Infinity, gx1 = -Infinity, gy1 = -Infinity;
+  for (const key of best.keys()) {
+    const x = key % width, y = (key - x) / width;
+    if (x < gx0) gx0 = x; if (x > gx1) gx1 = x;
+    if (y < gy0) gy0 = y; if (y > gy1) gy1 = y;
+  }
+  const gw = gx1 - gx0 + 1, gh = gy1 - gy0 + 1, n = gw * gh;
+  const type = new Uint8Array(n);
+  const sv = new Float32Array(n * 3);   // source, sqrt domain (footprint cells)
+  const d = new Float32Array(n * 3);    // δ: measured on the ring, solved elsewhere
+  const ringIdx = [];
+  const snapV = (x, y, c) => Math.sqrt(snap[(y * rw + x) * 3 + c] / 255);
+
+  for (const [key, v] of best) {
+    const x = key % width, y = (key - x) / width;
+    const g = (y - gy0) * gw + (x - gx0);
+    // nearest source pixel, clamped to the snapshot — identical rule to
+    // sampleNearest, so a heal stroke picks exactly the texels Clone would
+    const sx = Math.min(Math.max(Math.round(x + v.dx - rx0), 0), rw - 1);
+    const sy = Math.min(Math.max(Math.round(y + v.dy - ry0), 0), rh - 1);
+    if (v.dist <= outer) {
+      type[g] = 1;
+      for (let c = 0; c < 3; c++) sv[g * 3 + c] = snapV(sx, sy, c);
+    } else {
+      type[g] = 2;
+      const lx = x - rx0, ly = y - ry0;
+      for (let c = 0; c < 3; c++) d[g * 3 + c] = snapV(lx, ly, c) - snapV(sx, sy, c);
+      ringIdx.push(g);
+    }
+  }
+
+  // robust outlier rejection on the ring (per channel; one bad channel
+  // rejects the sample)
+  if (ringIdx.length >= 8) {
+    for (let c = 0; c < 3; c++) {
+      const vals = ringIdx.map((g) => d[g * 3 + c]);
+      const med = median(vals);
+      const spread = Math.max(1.4826 * median(vals.map((x) => Math.abs(x - med))), HEAL_OUTLIER_FLOOR);
+      for (const g of ringIdx) if (Math.abs(d[g * 3 + c] - med) > HEAL_OUTLIER_K * spread) type[g] = 3;
+    }
+  }
+  /* Then smooth the surviving ring δ ALONG the ring (mean of valid ring
+     samples within ringR of each one). On structured texture — brick and
+     mortar, tiles — a source offset that isn't an exact multiple of the
+     pattern puts mortar against brick at alternating spots around the
+     ring, so per-sample δ flips between "+orange" and "+white". That
+     split is bimodal, so the rejection above can't tell which half is
+     wrong, and the membrane would carry each flip into a color blob near
+     the edge (seen on a real brick-wall photo). Averaging over a window
+     wider than the pattern cancels the flips, while samples already
+     rejected (a wire crossing the ring) stay out of every average — which
+     is why this runs AFTER rejection rather than replacing it with
+     blurred inputs (tried: a wide blur folds the wire back in). */
+  if (ringR > 0 && ringIdx.length) {
+    const SW = gw + 1, sat = new Float64Array(SW * (gh + 1) * 4);
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const g = j * gw + i, q = ((j + 1) * SW + i + 1) * 4, up = (j * SW + i + 1) * 4, lf = ((j + 1) * SW + i) * 4, ul = (j * SW + i) * 4;
+      const ok = type[g] === 2 ? 1 : 0;
+      for (let k = 0; k < 4; k++) sat[q + k] = (k < 3 ? d[g * 3 + k] * ok : ok) + sat[up + k] + sat[lf + k] - sat[ul + k];
+    }
+    const sm = new Float32Array(ringIdx.length * 3);
+    ringIdx.forEach((g, t) => {
+      if (type[g] !== 2) return;
+      const i = g % gw, j = (g - i) / gw;
+      const x0 = Math.max(0, i - ringR), y0 = Math.max(0, j - ringR), x1 = Math.min(gw, i + ringR + 1), y1 = Math.min(gh, j + ringR + 1);
+      const at = (y, x, k) => sat[(y * SW + x) * 4 + k];
+      const cnt = at(y1, x1, 3) - at(y0, x1, 3) - at(y1, x0, 3) + at(y0, x0, 3);
+      for (let c = 0; c < 3; c++) sm[t * 3 + c] = (at(y1, x1, c) - at(y0, x1, c) - at(y1, x0, c) + at(y0, x0, c)) / cnt;
+    });
+    ringIdx.forEach((g, t) => { if (type[g] === 2) for (let c = 0; c < 3; c++) d[g * 3 + c] = sm[t * 3 + c]; });
+  }
+
+  const known = (t) => t === 2;
+  let anyKnown = false;
+  for (const g of ringIdx) if (known(type[g])) { anyKnown = true; break; }
+
+  if (anyKnown) {
+    // ---- push: normalized-convolution pyramid ([1,2,1]/4 per axis, stride 2)
+    const levels = [{ w: gw, h: gh, A: new Float32Array(n * 3), W: new Float32Array(n) }];
+    for (let g = 0; g < n; g++) {
+      if (!known(type[g])) continue;
+      levels[0].W[g] = 1;
+      for (let c = 0; c < 3; c++) levels[0].A[g * 3 + c] = d[g * 3 + c];
+    }
+    const K = [0.25, 0.5, 0.25];
+    while (levels[levels.length - 1].w > 1 || levels[levels.length - 1].h > 1) {
+      const f = levels[levels.length - 1];
+      const w = Math.ceil(f.w / 2), h = Math.ceil(f.h / 2);
+      const A = new Float32Array(w * h * 3), W = new Float32Array(w * h);
+      for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+        let a0 = 0, a1 = 0, a2 = 0, ww = 0;
+        for (let b = -1; b <= 1; b++) {
+          const y = 2 * j + b; if (y < 0 || y >= f.h) continue;
+          for (let a = -1; a <= 1; a++) {
+            const x = 2 * i + a; if (x < 0 || x >= f.w) continue;
+            const k = K[a + 1] * K[b + 1], q = y * f.w + x;
+            ww += k * f.W[q];
+            a0 += k * f.A[q * 3]; a1 += k * f.A[q * 3 + 1]; a2 += k * f.A[q * 3 + 2];
+          }
+        }
+        const q = j * w + i;
+        W[q] = ww; A[q * 3] = a0; A[q * 3 + 1] = a1; A[q * 3 + 2] = a2;
+      }
+      levels.push({ w, h, A, W });
+    }
+    // ---- pull: coarse estimate, upsampled bilinearly and blended under
+    // each level's own (weight-saturated) measurement
+    let F = null;
+    for (let l = levels.length - 1; l >= 0; l--) {
+      const L = levels[l];
+      const out = new Float32Array(L.w * L.h * 3);
+      const prev = F, P = l + 1 < levels.length ? levels[l + 1] : null;
+      for (let j = 0; j < L.h; j++) for (let i = 0; i < L.w; i++) {
+        const q = j * L.w + i;
+        let u0 = 0, u1 = 0, u2 = 0;
+        if (prev) {
+          const fx = Math.min(Math.max((i + 0.5) / 2 - 0.5, 0), P.w - 1);
+          const fy = Math.min(Math.max((j + 0.5) / 2 - 0.5, 0), P.h - 1);
+          const x0 = Math.floor(fx), y0 = Math.floor(fy);
+          const x1 = Math.min(x0 + 1, P.w - 1), y1 = Math.min(y0 + 1, P.h - 1);
+          const tx = fx - x0, ty = fy - y0;
+          const w00 = (1 - tx) * (1 - ty), w10 = tx * (1 - ty), w01 = (1 - tx) * ty, w11 = tx * ty;
+          const q00 = (y0 * P.w + x0) * 3, q10 = (y0 * P.w + x1) * 3, q01 = (y1 * P.w + x0) * 3, q11 = (y1 * P.w + x1) * 3;
+          u0 = w00 * prev[q00] + w10 * prev[q10] + w01 * prev[q01] + w11 * prev[q11];
+          u1 = w00 * prev[q00 + 1] + w10 * prev[q10 + 1] + w01 * prev[q01 + 1] + w11 * prev[q11 + 1];
+          u2 = w00 * prev[q00 + 2] + w10 * prev[q10 + 2] + w01 * prev[q01 + 2] + w11 * prev[q11 + 2];
+        }
+        const wt = L.W[q];
+        // a cell with ≥25% real coverage trusts its own measurement; the
+        // finest level's known cells (W = 1) keep their exact δ
+        const alpha = prev ? Math.min(1, wt * 4) : 1;
+        const inv = wt > 1e-6 ? 1 / wt : 0;
+        out[q * 3] = alpha * L.A[q * 3] * inv + (1 - alpha) * u0;
+        out[q * 3 + 1] = alpha * L.A[q * 3 + 1] * inv + (1 - alpha) * u1;
+        out[q * 3 + 2] = alpha * L.A[q * 3 + 2] * inv + (1 - alpha) * u2;
+      }
+      F = out;
+    }
+    for (let g = 0; g < n; g++) {
+      if (type[g] === 1 || type[g] === 3) for (let c = 0; c < 3; c++) d[g * 3 + c] = F[g * 3 + c];
+    }
+    // ---- refine: plain Gauss-Seidel averaging over the free cells (4-
+    // neighbors within the domain). No over-relaxation: every update is a
+    // convex average, so δ can't leave the ring's own range.
+    for (let it = 0; it < HEAL_SWEEPS; it++) {
+      for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+        const g = j * gw + i;
+        if (type[g] !== 1 && type[g] !== 3) continue;
+        let s0 = 0, s1 = 0, s2 = 0, cnt = 0;
+        if (i > 0 && type[g - 1]) { s0 += d[(g - 1) * 3]; s1 += d[(g - 1) * 3 + 1]; s2 += d[(g - 1) * 3 + 2]; cnt++; }
+        if (i < gw - 1 && type[g + 1]) { s0 += d[(g + 1) * 3]; s1 += d[(g + 1) * 3 + 1]; s2 += d[(g + 1) * 3 + 2]; cnt++; }
+        if (j > 0 && type[g - gw]) { s0 += d[(g - gw) * 3]; s1 += d[(g - gw) * 3 + 1]; s2 += d[(g - gw) * 3 + 2]; cnt++; }
+        if (j < gh - 1 && type[g + gw]) { s0 += d[(g + gw) * 3]; s1 += d[(g + gw) * 3 + 1]; s2 += d[(g + gw) * 3 + 2]; cnt++; }
+        if (!cnt) continue;
+        d[g * 3] = s0 / cnt; d[g * 3 + 1] = s1 / cnt; d[g * 3 + 2] = s2 / cnt;
+      }
+    }
+  } else {
+    // no usable boundary (stroke entirely surrounded by off-buffer area or
+    // rejected samples) — degrade to a plain clone rather than guess
+    d.fill(0);
+  }
+
+  return {
+    get(key) {
+      const x = key % width, y = (key - x) / width;
+      const g = ((y - gy0) * gw + (x - gx0)) * 3;
+      const out = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        const v = Math.min(1, Math.max(0, sv[g + c] + d[g + c]));
+        // rounded: a Node Buffer (bakeRaw) truncates float writes
+        out[c] = Math.round(v * v * 255);
+      }
+      return out;
+    },
+  };
+}
+
 /* Composites one stroke — its whole polyline as a single smooth capsule —
    onto buf in place. `stroke` = { points:[{x,y,dx?,dy?}], radius, dx, dy,
    feather, opacity } (already normalized).
@@ -251,10 +496,20 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
   const feather = Number.isFinite(stroke.feather) ? stroke.feather : DEFAULT_FEATHER;
   const opacity = Number.isFinite(stroke.opacity) ? Math.min(1, stroke.opacity) : DEFAULT_OPACITY;
   const outer = radius * (1 + feather);
-  const dxs = pts.map((p) => (p.dx ?? stroke.dx));
-  const dys = pts.map((p) => (p.dy ?? stroke.dy));
+  // heal also needs the thin boundary ring just outside the footprint (see
+  // the module header's HEAL section); for Clone `ring` is 0 and `reach`
+  // is exactly `outer`, so everything below is unchanged for it.
+  const heal = stroke.mode === "heal";
+  // per-point offset overrides belong to Clone's manual source; a heal
+  // stroke has one automatic offset (findHealSource) — a stroke switched
+  // from Clone to Heal may still carry overrides, which must not apply
+  const dxs = pts.map((p) => (heal ? stroke.dx : (p.dx ?? stroke.dx)));
+  const dys = pts.map((p) => (heal ? stroke.dy : (p.dy ?? stroke.dy)));
+  const ring = heal ? Math.max(HEAL_RING_MIN, radius * HEAL_RING_FRAC) : 0;
+  const reach = outer + ring;
+  const ringR = heal ? Math.max(1, Math.round(radius * HEAL_RING_SMOOTH)) : 0;
 
-  const readMargin = outer + 1;
+  const readMargin = reach + 1;
   let rx0 = Infinity, ry0 = Infinity, rx1 = -Infinity, ry1 = -Infinity;
   for (let i = 0; i < pts.length; i++) {
     const sx = pts[i].x + dxs[i], sy = pts[i].y + dys[i];
@@ -287,16 +542,16 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
   for (let s = 0; s < segCount; s++) {
     const i0 = s, i1 = pts.length > 1 ? s + 1 : 0;
     const ax = pts[i0].x, ay = pts[i0].y, bx = pts[i1].x, by = pts[i1].y;
-    const sx0 = Math.max(0, Math.floor(Math.min(ax, bx) - outer));
-    const sx1 = Math.min(width - 1, Math.ceil(Math.max(ax, bx) + outer));
-    const sy0 = Math.max(0, Math.floor(Math.min(ay, by) - outer));
-    const sy1 = Math.min(height - 1, Math.ceil(Math.max(ay, by) + outer));
+    const sx0 = Math.max(0, Math.floor(Math.min(ax, bx) - reach));
+    const sx1 = Math.min(width - 1, Math.ceil(Math.max(ax, bx) + reach));
+    const sy0 = Math.max(0, Math.floor(Math.min(ay, by) - reach));
+    const sy1 = Math.min(height - 1, Math.ceil(Math.max(ay, by) + reach));
     if (sx1 < sx0 || sy1 < sy0) continue;
     for (let y = sy0; y <= sy1; y++) {
       for (let x = sx0; x <= sx1; x++) {
         const c = closestOnSegment(x, y, ax, ay, bx, by);
         const dist = Math.hypot(x - c.x, y - c.y);
-        if (dist > outer) continue;
+        if (dist > reach) continue;
         const key = y * width + x;
         const prev = best.get(key);
         if (prev && prev.dist <= dist) continue;
@@ -310,7 +565,20 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     }
   }
 
+  const healed = heal ? healSource(best, snap, rx0, ry0, rw, rh, width, outer, ringR) : null;
+  // Remove: content-aware fill of the whole footprint, no source at all
+  // (electron/removeTool.mjs). Reads buf before anything below writes it.
+  let removed = null;
+  if (stroke.mode === "remove") {
+    const holeKeys = [];
+    for (const [key, v] of best) if (v.dist <= outer) holeKeys.push(key);
+    const strokeKey = `${radius.toFixed(2)}|${feather}|${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(";")}`;
+    if (holeKeys.length) removed = removeFill(buf, width, height, channels, holeKeys, strokeKey);
+  }
+
   for (const [key, v] of best) {
+    // ring pixels (heal only, dist > outer) land at alphaGeom 0 here and
+    // are never written — they're read-only boundary samples
     const alphaGeom = 1 - smoothstep(radius, outer, v.dist);
     if (alphaGeom <= 0) continue;
     const x = key % width, y = (key - x) / width;
@@ -320,14 +588,178 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     const dithered = alphaGeom >= 1 ? 1 : ditherThreshold(x, y) < alphaGeom ? 1 : 0;
     const alpha = dithered * opacity;
     if (alpha <= 0) continue;
-    const [sr, sg, sb] = sampleNearest(snap, rw, rh, 3, x + v.dx - rx0, y + v.dy - ry0);
+    // Clone: raw 1:1 copy — no correction added to sr/sg/sb, matching real
+    // Photoshop's Clone Stamp (see module header). Heal: the same source
+    // pixel, re-toned by the interpolated boundary correction.
+    const [sr, sg, sb] = removed ? removed.get(key) : healed ? healed.get(key) : sampleNearest(snap, rw, rh, 3, x + v.dx - rx0, y + v.dy - ry0);
     const o = key * channels;
-    // Raw 1:1 copy — no correction added to sr/sg/sb, matching real
-    // Photoshop's Clone Stamp (see module header).
     buf[o] = buf[o] * (1 - alpha) + sr * alpha;
     buf[o + 1] = buf[o + 1] * (1 - alpha) + sg * alpha;
     buf[o + 2] = buf[o + 2] * (1 - alpha) + sb * alpha;
   }
+}
+
+/* ============================================================
+   Automatic source for HEAL strokes — Heal has no user-chosen source
+   (Lightroom's Heal picks it for you, the same way: Camera Raw's own
+   "FindRetouchSource" step), so the stroke's (dx, dy) is computed here
+   from the photo instead of dragged by hand. Clone keeps its manual,
+   dragged source — this is only ever called for mode "heal".
+
+   Candidates: HEAL_SRC_ANGLES directions × HEAL_SRC_DIST_MULTS distances
+   around the stroke. A candidate is rejected if its copied area would
+   leave the buffer, overlap the stroke's own footprint (it would copy the
+   very defect being removed), or overlap another stroke (`obstacles`).
+   Survivors are scored, lowest wins:
+     context  — around the ring: destination − source, minus the best-fit
+                PLANE per channel (the heal blend itself removes any tone
+                offset and smooth gradient, so those must not count), then
+                the MEDIAN size of what's left. Low = the source's
+                surrounding STRUCTURE matches the destination's: a source
+                taken along a shadow band, a fold, a horizon continues it
+                (a plain squared difference preferred flat, uniform areas
+                instead, and on a spot inside the shadow under a lip pasted
+                a light "window" into the shadow). Median, so a wire or a
+                spire crossing part of the ring can't dominate.
+     patch    — a light penalty (HEAL_SRC_PATCH_W) on the candidate's
+                interior differing from the median color of the
+                destination's surroundings, against copying in an obvious
+                foreign object
+     distance — a small tie-breaker toward nearer sources
+   The heal blend then removes whatever tone difference remains, so the
+   search only has to get texture and content right.
+   ============================================================ */
+const HEAL_SRC_ANGLES = 24;
+const HEAL_SRC_DIST_MULTS = [1.15, 1.5, 2, 2.7, 3.6, 5, 7]; // × the footprint's WIDTH (2·outer) — not its length: a long
+                                                       // wire needs a small sideways shift, and along-the-stroke
+                                                       // candidates are rejected by the overlap check anyway
+const HEAL_SRC_BAND = 0.6;                             // context band width, × radius
+const HEAL_SRC_SAMPLES = 360;
+const HEAL_SRC_PATCH_W = 0.25;                          // target sample count per region (subsampled on a grid)
+
+/* Least-squares plane v ≈ a + b·x + c·y through the samples; returns the
+   residuals (falls back to "minus the mean" if the fit is degenerate). */
+function planeResiduals(xs, ys, vs) {
+  const n = vs.length;
+  let sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sv = 0, sxv = 0, syv = 0;
+  for (let i = 0; i < n; i++) { const x = xs[i], y = ys[i], v = vs[i]; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sv += v; sxv += x * v; syv += y * v; }
+  const A = [[n, sx, sy], [sx, sxx, sxy], [sy, sxy, syy]], b = [sv, sxv, syv];
+  const det3 = (M) => M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+  const D = det3(A);
+  if (Math.abs(D) < 1e-9) { const m = sv / n; return vs.map((v) => v - m); }
+  const p = [0, 1, 2].map((col) => det3(A.map((r, i) => r.map((x, j) => (j === col ? b[i] : x)))) / D);
+  return vs.map((v, i) => v - (p[0] + p[1] * xs[i] + p[2] * ys[i]));
+}
+
+function distToPolyline(pts, x, y) {
+  let best = Infinity;
+  const segs = pts.length > 1 ? pts.length - 1 : 1;
+  for (let s = 0; s < segs; s++) {
+    const a = pts[s], b = pts[pts.length > 1 ? s + 1 : 0];
+    const c = closestOnSegment(x, y, a.x, a.y, b.x, b.y);
+    const d = Math.hypot(x - c.x, y - c.y);
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/* pts/radius/obstacles in this buffer's pixel space. Returns { dx, dy },
+   or null when no candidate fits (tiny buffer, stroke covering most of it). */
+export function findHealSource(buf, width, height, channels, pts, radius, feather, obstacles = []) {
+  if (!pts || !pts.length || !(radius > 0)) return null;
+  const outer = radius * (1 + (Number.isFinite(feather) ? feather : DEFAULT_FEATHER));
+  const band = outer + Math.max(3, radius * HEAL_SRC_BAND);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of pts) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+  // sample the footprint (hole) and the context band on a grid sized to
+  // land near HEAL_SRC_SAMPLES points each
+  const bandArea = Math.PI * (band * band - outer * outer) + 2 * (band - outer) * Math.hypot(x1 - x0, y1 - y0);
+  const step = Math.max(1, Math.sqrt(bandArea / HEAL_SRC_SAMPLES));
+  const hole = [], ring = [];
+  for (let y = Math.floor(y0 - band); y <= y1 + band; y += step) {
+    for (let x = Math.floor(x0 - band); x <= x1 + band; x += step) {
+      const xi = Math.round(x), yi = Math.round(y);
+      if (xi < 0 || yi < 0 || xi >= width || yi >= height) continue;
+      const d = distToPolyline(pts, xi, yi);
+      if (d <= outer) hole.push(xi, yi);
+      else if (d <= band) ring.push(xi, yi);
+    }
+  }
+  if (hole.length === 0 || ring.length < 6) return null;
+  const px = (x, y, c) => buf[(y * width + x) * channels + c];
+
+  // background reference: per-channel median of the destination's band
+  const med = [0, 1, 2].map((c) => {
+    const v = [];
+    for (let i = 0; i < ring.length; i += 2) v.push(px(ring[i], ring[i + 1], c));
+    return median(v);
+  });
+
+  // footprint occupancy mask (radius outer·1.05) over its own bounding box,
+  // rasterized segment by segment — makes the per-candidate overlap test
+  // O(1) per sample instead of a distance-to-polyline walk (which made a
+  // long wire stroke cost ~50 ms per search)
+  const keep = outer * 1.05;
+  const mx0 = Math.floor(x0 - keep), my0 = Math.floor(y0 - keep);
+  const mw = Math.ceil(x1 + keep) - mx0 + 1, mh = Math.ceil(y1 + keep) - my0 + 1;
+  const mask = new Uint8Array(mw * mh);
+  const segs = pts.length > 1 ? pts.length - 1 : 1;
+  for (let sgi = 0; sgi < segs; sgi++) {
+    const a = pts[sgi], b = pts[pts.length > 1 ? sgi + 1 : 0];
+    const sx0 = Math.max(mx0, Math.floor(Math.min(a.x, b.x) - keep)), sx1 = Math.min(mx0 + mw - 1, Math.ceil(Math.max(a.x, b.x) + keep));
+    const sy0 = Math.max(my0, Math.floor(Math.min(a.y, b.y) - keep)), sy1 = Math.min(my0 + mh - 1, Math.ceil(Math.max(a.y, b.y) + keep));
+    for (let y = sy0; y <= sy1; y++) for (let x = sx0; x <= sx1; x++) {
+      const c = closestOnSegment(x, y, a.x, a.y, b.x, b.y);
+      if (Math.hypot(x - c.x, y - c.y) <= keep) mask[(y - my0) * mw + (x - mx0)] = 1;
+    }
+  }
+  const inFootprint = (x, y) => {
+    const ix = Math.round(x) - mx0, iy = Math.round(y) - my0;
+    return ix >= 0 && iy >= 0 && ix < mw && iy < mh && mask[iy * mw + ix] === 1;
+  };
+
+  const diam = 2 * outer;
+  const cxs = 0.5 * (x0 + x1), cys = 0.5 * (y0 + y1);
+  let best = null;
+  for (const mult of HEAL_SRC_DIST_MULTS) {
+    const dist = diam * mult;
+    for (let k = 0; k < HEAL_SRC_ANGLES; k++) {
+      const ang = (k / HEAL_SRC_ANGLES) * Math.PI * 2;
+      const dx = Math.cos(ang) * dist, dy = Math.sin(ang) * dist;
+      // reject: copied area off-buffer, or overlapping this stroke / others
+      let ok = true;
+      for (let i = 0; i < hole.length && ok; i += 2) {
+        const sx = hole[i] + dx, sy = hole[i + 1] + dy;
+        if (sx < 0 || sy < 0 || sx >= width - 1 || sy >= height - 1) ok = false;
+        else if (inFootprint(sx, sy)) ok = false;
+        else for (const o of obstacles) if (Math.hypot(sx - o.x, sy - o.y) <= o.radius * 1.05) { ok = false; break; }
+      }
+      if (!ok) continue;
+      // fit: dest − source around the ring, minus the best PLANE per channel
+      // (heal's own correction removes any tone offset and smooth gradient),
+      // scored by the robust (median) size of what's left — i.e. "does the
+      // source's surrounding STRUCTURE match", independent of its tone
+      const dl = [[], [], []], xs = [], ys = [];
+      for (let i = 0; i < ring.length; i += 2) {
+        const sx = Math.round(ring[i] + dx), sy = Math.round(ring[i + 1] + dy);
+        if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
+        xs.push(ring[i] - cxs); ys.push(ring[i + 1] - cys);
+        for (let c = 0; c < 3; c++) dl[c].push((px(ring[i], ring[i + 1], c) - px(sx, sy, c)) / 255);
+      }
+      const nc = xs.length;
+      if (nc < 6) continue;
+      let context = 0;
+      for (let c = 0; c < 3; c++) context += median(planeResiduals(xs, ys, dl[c]).map(Math.abs));
+      let patch = 0;
+      for (let i = 0; i < hole.length; i += 2) {
+        const sx = Math.round(hole[i] + dx), sy = Math.round(hole[i + 1] + dy);
+        for (let c = 0; c < 3; c++) { const e = (px(sx, sy, c) - med[c]) / 255; patch += e * e; }
+      }
+      const score = context + HEAL_SRC_PATCH_W * patch / (hole.length / 2) + 0.0005 * mult;
+      if (!best || score < best.score) best = { score, dx, dy };
+    }
+  }
+  return best ? { dx: best.dx, dy: best.dy } : null;
 }
 
 /* Mutates buf in place (a Node Buffer or a Uint8ClampedArray alike) and

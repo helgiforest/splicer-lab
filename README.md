@@ -2,15 +2,18 @@
 
 **A fast, fully local photo editor** — library, non-destructive develop tools, precision crop, clone stamp retouching, and size-targeted export. One app, no bloat, nothing leaves your machine.
 
-![Splicer Lab](https://img.shields.io/badge/version-3.1.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+![Splicer Lab](https://img.shields.io/badge/version-3.2.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 
 ## Features
 
 - **Photo library** that mirrors your real folders — import once and it stays in sync with disk, even while the app is closed. Filter by rating, an "Edited" view, or folder; multi-select for batch export or reset. Removing a folder from the library (right-click it in the sidebar) never touches the files on disk. Originals are **never modified**; every edit is non-destructive.
-- **Develop module**: Temperature, Tint, Saturation, Exposure, Contrast, Highlights, Shadows, Black/White point — all live, all reversible. A real-time histogram reflects the current crop and shows red clipping bars when the black or white point pushes pixels past 0% or 100%.
+- **Develop module**: Temperature, Tint, Vibrance, Saturation, Exposure, Contrast, Highlights, Shadows, Whites, Blacks, plus Texture, Clarity and Dehaze — all live, all reversible, in collapsible sections with per-section reset. A white-balance eyedropper (`W`) sets Temperature and Tint from anything that should be neutral. A real-time histogram reflects the current crop and shows red clipping bars when the black or white point pushes pixels past 0% or 100%.
 - **Clone Stamp**: paint from any source point to duplicate or remove detail — a raw, pixel-for-pixel copy, exactly like Photoshop's real Clone Stamp, with no automatic color correction. Adjustable brush size, feather and opacity. Fully non-destructive — edit it again anytime.
+- **Heal**: like Clone Stamp, but the copied texture takes on the light and color around the spot, so blemishes, dust and small distractions vanish seamlessly. The source is found automatically, and re-searched whenever you change the stroke.
+- **Remove**: paint over something and it's rebuilt from the photo itself — no source point to pick. Local neural inpainting decides the shape and light (MI-GAN for ordinary spots, the larger LaMa for big objects), with grain matched to the photo around it. Runs fully offline on your machine.
+- **Red-eye removal**: drag a box around a red eye (or just click it) and the pupil is found and darkened naturally, with adjustable pupil size and darkness.
 - **Before/After**: hold Compare (or `\`) to see the untouched original in the exact same crop and framing, then let go to snap back to your edit.
 - **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5, flip any of them), rule-of-thirds grid, quarter-turn rotation (works from the viewer too, not just inside Crop), a fine ±45° leveling slider, deep-zoom sharpening for pixel-precise framing, full undo/redo.
 - **Size-targeted export**: type "9 MB" and Splicer Lab binary-searches the encoder to land just under it. MozJPEG and high-effort WebP, with a live estimate before you save. Save reusable **export presets** (size, format, destination folder) for one-click batch export.
@@ -101,9 +104,17 @@ Requires [Node.js](https://nodejs.org) 18+.
 ```bash
 git clone https://github.com/helgiforest/splicer-lab.git
 cd splicer-lab
-npm install
+npm install        # also downloads the 208 MB LaMa model (too big for git)
 npm start          # build & run
 npm run dist       # create the installer for your OS in release/
 ```
 
 Tech: Electron + React + Vite; sharp/libvips with MozJPEG for encoding; dcraw (in a worker thread) for RAW development.
+
+---
+
+## Third-party components
+
+- **MI-GAN** inpainting model (`electron/models/migan_pipeline_v2.onnx`) — © 2024 Picsart AI Research, MIT License (code and weights), see `electron/models/LICENSE-MIGAN`.
+- **LaMa** inpainting model (`electron/models/lama_fp32.onnx`) — big-lama by Samsung AI Center (advimman/lama), ONNX port by Carve, Apache License 2.0, see `electron/models/LICENSE-LAMA`.
+- **ONNX Runtime Web** (`onnxruntime-web`) — © Microsoft Corporation, MIT License.

@@ -4,3 +4,7 @@ release/
 debug.log
 .DS_Store
 Thumbs.db
+
+# downloaded by scripts/fetch-models.mjs on npm install (over GitHub's 100 MB limit)
+electron/models/lama_fp32.onnx
+electron/models/*.part
