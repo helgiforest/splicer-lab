@@ -2,7 +2,7 @@
 
 **A fast, fully local photo editor** — library, non-destructive develop tools, precision crop, clone stamp retouching, and size-targeted export. One app, no bloat, nothing leaves your machine.
 
-![Splicer Lab](https://img.shields.io/badge/version-3.2.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+![Splicer Lab](https://img.shields.io/badge/version-3.3.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 
