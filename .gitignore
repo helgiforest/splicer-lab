@@ -5,6 +5,7 @@ debug.log
 .DS_Store
 Thumbs.db
 
-# downloaded by scripts/fetch-models.mjs on npm install (over GitHub's 100 MB limit)
+# LaMa: downloaded by the app on demand into userData (over GitHub's 100 MB limit);
+# a local copy here is used in dev only and never packaged
 electron/models/lama_fp32.onnx
 electron/models/*.part

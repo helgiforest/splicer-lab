@@ -1,11 +1,12 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, cloneElement, Children } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useSyncExternalStore, cloneElement, Children } from "react";
 import { createPortal } from "react-dom";
 import {
   CURRENT_PV, defaultAdjust, normalizeAdjust, isDefaultAdjust, compileAdjust, needsGuides, computeGuides, neutralizeWhiteBalance,
   applyAdjustToRGBBuffer, DEHAZE_T_MIN, DEHAZE_OMEGA,
 } from "../electron/colorAdjust.mjs";
-import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp, findHealSource } from "../electron/stampTool.mjs";
-import { setNeuralEnabled, takeNeuralJobs, putNeuralResult } from "../electron/removeTool.mjs";
+import { autoStraightenAngle } from "../electron/autoStraighten.mjs";
+import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp, findHealSource, setStrokeCacheSink, packStrokeEntry, restoreStrokeCache } from "../electron/stampTool.mjs";
+import { setNeuralEnabled, setNeuralMode, takeNeuralJobs, putNeuralResult, setAsyncFill, fillDeferred, takeFillJobs, putFillResult, fillsInProgress, inpaint } from "../electron/removeTool.mjs";
 import {
   isEmptyRedEye, normalizeRedEye, detectRedEye, applyRedEyeToRGBBuffer, mapRedEye,
   REDEYE_DEFAULT_SIZE, REDEYE_DEFAULT_DARKEN,
@@ -111,8 +112,12 @@ function mapRedEyeEdits(redeye, origW, origH, e, s, outW, outH) {
   }, t, s);
 }
 
-/* bake a small edited preview from the PROXY (fast even for 200-MP files) */
-async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
+/* bake a small edited preview from the PROXY (fast even for 200-MP files).
+   bg: pass an object to leave Remove strokes that are still being filled
+   out of this bake (background fills, no PatchMatch on the UI thread) —
+   bg.deferred then says whether any was, so the caller can bake again
+   once the fills land. */
+async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560, bg = null) {
   // best-effort: a canvas read failure here (e.g. a still-loading proxy file)
   // should just skip the live preview, never hand back a broken image
   try {
@@ -139,7 +144,9 @@ async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
     if (!isEmptyStamp(stampData) || !isEmptyRedEye(e.redeye) || !isDefaultAdjust(e.adjust)) {
       const id = ctx.getImageData(0, 0, outW, outH);
       if (!isEmptyStamp(stampData)) {
+        if (bg) setAsyncFill(true);
         applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(stampData, origW, origH, e, s, outW, outH));
+        if (bg) { setAsyncFill(false); bg.deferred = fillDeferred(); drainFillJobs(); }
       }
       if (!isEmptyRedEye(e.redeye)) {
         applyRedEyeToRGBBuffer(id.data, outW, outH, 4, mapRedEyeEdits(e.redeye, origW, origH, e, s, outW, outH));
@@ -531,7 +538,10 @@ input, select { font-family: inherit; }
 .track .fill {
   position: absolute; top: 50%; height: 4px; margin-top: -2px; border-radius: 99px; background: var(--accent);
   transition: height .14s, margin .14s; pointer-events: none;
-  left: calc(7px + (100% - 14px) * var(--a)); width: calc((100% - 14px) * (var(--b) - var(--a)));
+  /* thumb-center positions, except at the scale's own ends (--ea/--eb = 0),
+     where the fill runs to the line's edge instead of stopping 7px short */
+  left: calc((7px + (100% - 14px) * var(--a)) * var(--ea));
+  right: calc((7px + (100% - 14px) * (1 - var(--b))) * var(--eb));
 }
 .track .mid {
   position: absolute; top: 50%; width: 2px; height: 10px; margin: -5px 0 0 -1px; border-radius: 1px;
@@ -750,7 +760,7 @@ input, select { font-family: inherit; }
 }
 .tool svg { width: 18px; height: 18px; }
 
-.hud-dock { height: 76px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0 12px; }
+.hud-dock { height: 76px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 0 12px; container-type: inline-size; }
 .hud {
   display: flex; align-items: center; gap: 2px; padding: 6px; border-radius: 16px;
   max-width: 100%; white-space: nowrap; animation: hudin .22s cubic-bezier(.2,.9,.25,1.1);
@@ -820,6 +830,8 @@ button.hud-chip:hover { background: var(--glass-hover); }
   white-space: nowrap; transition: background .12s, color .12s; display: flex; align-items: center; gap: 8px;
 }
 .hud-btn:hover { background: var(--glass-hover); color: var(--text); }
+.hud-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+.hud-btn:disabled { opacity: .6; pointer-events: none; }
 .hud-done {
   height: 40px; padding: 0 8px 0 14px; border-radius: 10px; border: 0; background: var(--accent); color: var(--accent-ink);
   font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 9px; white-space: nowrap; flex-shrink: 0;
@@ -828,6 +840,51 @@ button.hud-chip:hover { background: var(--glass-hover); }
 .hud-done:hover { filter: brightness(1.07); }
 .hud-done:active { transform: translateY(.5px); }
 .hud-done .kbd { color: rgba(36,26,3,.7); background: rgba(36,26,3,.1); border-color: rgba(36,26,3,.16); }
+.ai-field { display: flex; align-items: center; gap: 10px; padding: 0 6px 0 8px; flex-shrink: 0; }
+.ai-lab { display: flex; flex-direction: column; gap: 4px; }
+.ai-name { display: flex; align-items: center; gap: 5px; font-size: 13px; font-weight: 650; line-height: 1; color: var(--text); white-space: nowrap; }
+.ai-name .spark { color: var(--accent); flex-shrink: 0; }
+.ai-sub { padding-left: 17px; font-size: 10.5px; font-weight: 600; line-height: 1; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ai-card {
+  position: absolute; left: 50%; bottom: 94px; transform: translateX(-50%); z-index: 7;
+  width: min(440px, calc(100% - 32px)); padding: 18px 18px 14px; border-radius: 16px; white-space: normal;
+  animation: hudin .22s cubic-bezier(.2,.9,.25,1.1);
+}
+.ai-title { font-size: 15px; font-weight: 700; color: var(--text); }
+.ai-text { margin: 6px 0 12px; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+.ai-opts { display: flex; flex-direction: column; gap: 6px; }
+.ai-opt {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 9px 12px; border-radius: 10px; text-align: left;
+  border: 1px solid var(--glass-stroke); background: var(--well); color: var(--text); transition: background .12s, border-color .12s;
+}
+.ai-opt:hover { background: var(--glass-hover); }
+.ai-opt.rec { border-color: var(--accent); }
+.ai-opt-name { font-size: 13px; font-weight: 650; display: flex; align-items: center; gap: 8px; }
+.ai-opt-name em { font-style: normal; font-size: 10.5px; font-weight: 650; padding: 2px 6px; border-radius: 5px; background: var(--accent-soft); color: var(--accent-text); }
+.ai-opt-sub { font-size: 11.5px; color: var(--muted); }
+.ai-foot { margin-top: 10px; font-size: 11px; color: var(--faint); }
+/* narrow canvas: drop what the HUD can live without, labels first */
+@container (max-width: 1000px) {
+  .hud .brush-prev, .hud .selchip-text, .hud-chip .chip-text, .ai-sub { display: none; }
+  .hud .hfield { min-width: 84px; padding: 3px 7px 0; }
+}
+@container (max-width: 760px) {
+  .hud-done .kbd, .hud .selchip { display: none; }
+  .ai-name { font-size: 0; gap: 0; }
+  .ai-field { gap: 6px; padding: 0 2px 0 6px; }
+  .hud .hsep { margin: 0 2px; }
+  .hud .hfield { min-width: 60px; padding: 3px 5px 0; }
+  .hud { padding: 5px; }
+  .ai-field .hud-seg button { padding: 0 6px; }
+  .hud-done { padding: 0 12px; }
+}
+.fill-pill {
+  position: absolute; left: 50%; top: 14px; transform: translateX(-50%); z-index: 6; pointer-events: none;
+  display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 13px 0 11px; border-radius: 15px;
+  font-size: 12px; font-weight: 600; color: var(--text);
+}
+.fill-pill .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--faint); border-top-color: var(--accent); animation: fillspin .8s linear infinite; }
+@keyframes fillspin { to { transform: rotate(360deg); } }
 
 /* topbar: primary Export */
 .btn-export {
@@ -1204,7 +1261,9 @@ function Tip({ text, children, side }) {
       const r = nodeRef.current?.getBoundingClientRect();
       if (!r) return;
       setBox(null);
-      setPos(side === "right" ? { x: r.right + 10, y: r.top + r.height / 2, right: true } : { x: r.left + r.width / 2, y: r.bottom + 8 });
+      setPos(side === "right"
+        ? { x: r.right + 10, y: r.top + r.height / 2, right: true, leftEdge: r.left }
+        : { x: r.left + r.width / 2, y: r.bottom + 8, topEdge: r.top });
     }, 1000);
   };
   const onLeave = () => { cancel(); setPos(null); setBox(null); };
@@ -1218,9 +1277,17 @@ function Tip({ text, children, side }) {
     if (!pos || !bubbleRef.current) return;
     const r = bubbleRef.current.getBoundingClientRect();
     const margin = 8;
-    if (pos.right) { setBox({ left: pos.x, top: pos.y - r.height / 2 }); return; }
+    const clampY = (t) => Math.max(margin, Math.min(t, window.innerHeight - margin - r.height));
+    if (pos.right) {
+      // no room on the right: the trigger's left side instead
+      const left = pos.x + r.width > window.innerWidth - margin ? pos.leftEdge - 10 - r.width : pos.x;
+      setBox({ left, top: clampY(pos.y - r.height / 2) });
+      return;
+    }
     const left = Math.max(margin, Math.min(pos.x - r.width / 2, window.innerWidth - margin - r.width));
-    setBox({ left, top: pos.y });
+    // no room below (the filmstrip at the window's bottom edge): above it
+    const top = pos.y + r.height > window.innerHeight - margin ? pos.topEdge - 8 - r.height : pos.y;
+    setBox({ left, top: clampY(top) });
   }, [pos]);
 
   if (!text) return children;
@@ -1338,7 +1405,7 @@ const HIST_CLIP_FRACTION = 0.004;
    Keep the transform math hand-in-sync with bakePreview if either changes.
    `crop` may be null (rect/view not ready yet) — falls back to the whole
    original frame, same default bakePreview itself uses. */
-async function sampleCroppedRGBBuffer(srcUrl, origW, origH, crop, maxDim) {
+async function sampleCroppedRGBBuffer(srcUrl, origW, origH, crop, maxDim, backgroundFills = false) {
   const img = await loadImage(srcUrl);
   const s0 = img.naturalWidth / origW;
   const e = crop || { theta: 0, qcx: 0, qcy: 0, cw: origW, ch: origH, stamp: [] };
@@ -1358,7 +1425,12 @@ async function sampleCroppedRGBBuffer(srcUrl, origW, origH, crop, maxDim) {
   ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
   const id = ctx.getImageData(0, 0, outW, outH);
   if (!isEmptyStamp(e.stamp)) {
+    // backgroundFills: Remove strokes still being filled are left out (the
+    // caller re-samples when fills land — see Histogram), instead of running
+    // PatchMatch right here on the UI thread
+    if (backgroundFills) setAsyncFill(true);
     applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(e.stamp, origW, origH, e, s, outW, outH));
+    if (backgroundFills) { setAsyncFill(false); drainFillJobs(); }
   }
   if (!isEmptyRedEye(e.redeye)) {
     applyRedEyeToRGBBuffer(id.data, outW, outH, 4, mapRedEyeEdits(e.redeye, origW, origH, e, s, outW, outH));
@@ -1373,6 +1445,13 @@ function Histogram({ srcUrl, iw, ih, crop, adjust }) {
   const canvasRef = useRef(null);
   const bufRef = useRef(null);
   const rafRef = useRef(0);
+  // re-sample when a background Remove fill lands (sampleCroppedRGBBuffer)
+  const [fillTick, setFillTick] = useState(0);
+  useEffect(() => {
+    const onFill = () => setFillTick((t) => t + 1);
+    fillRedraws.add(onFill);
+    return () => { fillRedraws.delete(onFill); };
+  }, []);
 
   const draw = useCallback(() => {
     const cached = bufRef.current;
@@ -1431,14 +1510,14 @@ function Histogram({ srcUrl, iw, ih, crop, adjust }) {
     let alive = true;
     bufRef.current = null;
     if (!srcUrl || !iw || !ih) return undefined;
-    sampleCroppedRGBBuffer(srcUrl, iw, ih, crop, HIST_SAMPLE_DIM).then((buf) => {
+    sampleCroppedRGBBuffer(srcUrl, iw, ih, crop, HIST_SAMPLE_DIM, true).then((buf) => {
       if (!alive) return;
       bufRef.current = buf;
       draw();
     }).catch(() => {});
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [srcUrl, iw, ih, crop, draw]);
+  }, [srcUrl, iw, ih, crop, draw, fillTick]);
 
   useEffect(() => {
     if (rafRef.current) return undefined;
@@ -1498,7 +1577,7 @@ function RangeTrack({ value, min, max, step = 1, origin = min, grad, bubble, ...
   return (
     <div
       className={`track ${grad ? "grad" : ""}`}
-      style={{ "--p": p, "--a": Math.min(p, o), "--b": Math.max(p, o), ...(grad ? { "--g": grad } : null) }}
+      style={{ "--p": p, "--a": Math.min(p, o), "--b": Math.max(p, o), "--ea": Math.min(p, o) > 0 ? 1 : 0, "--eb": Math.max(p, o) < 1 ? 1 : 0, ...(grad ? { "--g": grad } : null) }}
     >
       <div className="line" />
       {!grad && <div className="fill" />}
@@ -1955,23 +2034,136 @@ function mapRedEyeToTexSpace(redeye, texRegion, texW) {
    whole, just not yet aware of the newest stroke for a moment). */
 const GUIDE_RECOMPUTE_DELAY = 350;
 
-/* Remove mode's local neural fill (MI-GAN, main process — see
-   electron/neuralFill.mjs and removeTool.mjs's hybrid). A GLImage
-   composite fills Remove strokes with PatchMatch right away and queues
-   neural jobs; this sends them over IPC and, as results land, asks EVERY
-   GLImage to recomposite (a job queued by the base image may be taken by
-   the deep-zoom tile's drain, or vice versa — the module queue is shared). */
-const neuralRedraws = new Set();
+/* Remove mode's fills, both off the UI thread. PatchMatch: a GLImage
+   composite queues it (removeTool's setAsyncFill) and it runs in a Web
+   Worker (src/fillWorker.js). The networks (MI-GAN / LaMa): queued once
+   PatchMatch's crop exists, sent over IPC to main.cjs, which runs them in
+   their own utility process. Both go through main's disk cache first
+   (fill-cache-*), so a photo reopened later doesn't recompute its strokes.
+   As results land, EVERY GLImage recomposites (a job queued by the base
+   image may be taken by the deep-zoom tile's drain, or vice versa — the
+   module queues are shared). */
+const fillRedraws = new Set();
+// number of fills still running, for the "Filling…" pill (useFillsBusy)
+const fillBusy = { n: 0, subs: new Set() };
+function updateFillBusy() {
+  const n = fillsInProgress();
+  if (n === fillBusy.n) return;
+  fillBusy.n = n;
+  for (const notify of fillBusy.subs) notify();
+}
+function useFillsBusy() {
+  return useSyncExternalStore((notify) => { fillBusy.subs.add(notify); return () => fillBusy.subs.delete(notify); }, () => fillBusy.n);
+}
+// coalesced: fills landing close together cost one recomposite, not one each
+let redrawQueued = false;
+function redrawFills() {
+  updateFillBusy();
+  if (redrawQueued) return;
+  redrawQueued = true;
+  setTimeout(() => {
+    redrawQueued = false;
+    for (const redraw of fillRedraws) redraw();
+    updateFillBusy();
+  }, 40);
+}
+
+let fillWorker;
+function getFillWorker() {
+  if (fillWorker === undefined) {
+    try {
+      fillWorker = new Worker(new URL("./fillWorker.js", import.meta.url), { type: "module" });
+      fillWorker.onmessage = ({ data }) => {
+        if (data.straighten != null) { straightenCalls.get(data.straighten)?.(data.angle); straightenCalls.delete(data.straighten); return; }
+        finishFill(data.key, data.pm, true);
+      };
+    } catch {
+      fillWorker = null; // no worker: same fill, on this thread
+    }
+  }
+  return fillWorker;
+}
+function finishFill(key, pm, fresh) {
+  putFillResult(key, pm);
+  if (fresh && pm && NATIVE) window.meridian.fillCachePut(`pm|${key}`, pm).catch(() => {});
+  redrawFills();
+}
+function runFill(job) {
+  const worker = getFillWorker();
+  if (worker) { worker.postMessage(job, [job.img.buffer]); return; }
+  setTimeout(() => {
+    let pm = null;
+    try { inpaint(job.img, job.w, job.h, job.hole, job.seed); pm = Uint8Array.from(Uint8ClampedArray.from(job.img)); } catch {}
+    finishFill(job.key, pm, true);
+  }, 0);
+}
+function drainFillJobs() {
+  for (const j of takeFillJobs()) {
+    if (!NATIVE) { runFill(j); continue; }
+    window.meridian.fillCacheGet(`pm|${j.key}`, j.w * j.h * 3)
+      .then((hit) => (hit ? finishFill(j.key, new Uint8Array(hit), false) : runFill(j)))
+      .catch(() => runFill(j));
+  }
+  updateFillBusy();
+}
 function drainNeuralJobs() {
   if (!NATIVE || !window.meridian?.neuralInpaint) return;
-  const jobs = takeNeuralJobs();
-  for (const j of jobs) {
-    window.meridian.neuralInpaint({ w: j.w, h: j.h, rgb: j.rgb, hole: j.hole, engine: j.engine })
+  for (const j of takeNeuralJobs()) {
+    window.meridian.neuralInpaint({ key: j.key, w: j.w, h: j.h, rgb: j.rgb, hole: j.hole, engine: j.engine })
       .then((r) => putNeuralResult(j.key, r ? new Uint8Array(r) : null))
       .catch(() => putNeuralResult(j.key, null))
-      .then(() => { for (const redraw of neuralRedraws) redraw(); });
+      .then(redrawFills);
   }
+  updateFillBusy();
 }
+
+/* Auto Straighten (electron/autoStraighten.mjs, run in the same worker):
+   the photo as the user sees it — its quarter turns applied, uncropped —
+   at Lightroom's analysis size, 1024 px on the long edge. Resolves to the
+   fine angle that levels it (degrees, Splicer's theta sign) or null. */
+const straightenCalls = new Map();
+let straightenSeq = 0;
+async function autoStraightenPhoto(srcUrl, quarterTurns, focal35) {
+  const img = await loadImage(srcUrl);
+  const s = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+  const q = ((quarterTurns % 4) + 4) % 4;
+  const canvas = document.createElement("canvas");
+  canvas.width = q % 2 ? h : w;
+  canvas.height = q % 2 ? w : h;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(q * Math.PI / 2);
+  ctx.drawImage(img, -w / 2, -h / 2, w, h);
+  const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const worker = getFillWorker();
+  if (!worker) return autoStraightenAngle(data, width, height, 4, focal35);
+  return new Promise((resolve) => {
+    const id = ++straightenSeq;
+    straightenCalls.set(id, resolve);
+    worker.postMessage({ straighten: id, pixels: data, width, height, focal35 }, [data.buffer]);
+  });
+}
+
+/* finished strokes of the on-screen composite go to the disk cache too
+   (stampTool's restoreStrokeCache brings them back on the next open) —
+   only while strokePersist is on: not for small bakes, not mid-drag */
+let strokePersist = false;
+if (NATIVE) {
+  setStrokeCacheSink((key, entry) => {
+    if (strokePersist) window.meridian.fillCachePut(`st|${key}`, packStrokeEntry(entry)).catch(() => {});
+  });
+}
+
+const SPARKLE = <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" className="spark"><path d="M12 2.5l1.9 5.6a3 3 0 0 0 1.9 1.9l5.6 1.9-5.6 1.9a3 3 0 0 0-1.9 1.9L12 21.5l-1.9-5.6a3 3 0 0 0-1.9-1.9L2.6 12l5.6-1.9a3 3 0 0 0 1.9-1.9z"/></svg>;
+
+/* AI for Remove: opt-in modes (main.cjs's "AI for Remove" section) */
+const AI_MODES = [
+  { key: "off", label: "Off", tip: "No AI — content-aware fill only" },
+  { key: "fast", label: "Fast", tip: "MI-GAN — quick neural fill, included" },
+  { key: "max", label: "Max", tip: "LaMa for big objects — best structure, slower" },
+];
 
 function GLImage({ className, style, src, draggable, adjust, stamp, draft, redeye, texRegion, origDiag }) {
   const canvasRef = useRef(null);
@@ -2001,6 +2193,7 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
   const pristineRef = useRef(null); // { src, width, height, data, img } — decoded once per unique `src`
   const uploadTokenRef = useRef(0);
   const uploadRafRef = useRef(0);
+  const restoredRef = useRef(null); // { src, done }: the image whose strokes are restored from disk (restoreStrokeCache)
 
   /* Guide planes for the latest composite (see GUIDE_RECOMPUTE_DELAY).
      Only ever runs when a guide-reading slider is actually in use — draw()
@@ -2229,15 +2422,35 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
     const texStamp = mapStampToTexSpace(strokesForComposite, texRegionRef.current, p.width);
     const texRedEye = mapRedEyeToTexSpace(redeyeRef.current, texRegionRef.current, p.width);
     // same order as every bake path: stamp/heal → red eye → (color, in the shader)
+    // first composite of a newly decoded image: bring its finished strokes
+    // back from disk first (a few ms each), so opening an edited photo
+    // replays them instead of recomputing every one; the photo shows once
+    // that's done
+    if (texStamp.length && NATIVE && restoredRef.current?.src !== p.src) {
+      const r = restoredRef.current = { src: p.src, done: false };
+      restoreStrokeCache(new Uint8ClampedArray(p.data), p.width, p.height, 4, texStamp,
+        (key) => window.meridian.fillCacheGet(`st|${key}`, 0).catch(() => null))
+        .catch(() => {})
+        .then(() => { r.done = true; scheduleUpload(); });
+      return;
+    }
+    // still restoring: a composite now would recompute what's being loaded
+    if (restoredRef.current?.src === p.src && !restoredRef.current.done) return;
     let pixels = p.data;
     if (texStamp.length || texRedEye.length) {
       pixels = new Uint8ClampedArray(p.data);
       if (texStamp.length) {
-        // queue neural jobs only for THIS on-screen composite (not for the
-        // histogram's or thumbnails' own small bakes) — see drainNeuralJobs
+        // background fills and neural jobs only for THIS on-screen composite
+        // (not for the histogram's or thumbnails' own small bakes) — see
+        // drainFillJobs / drainNeuralJobs
         setNeuralEnabled(NATIVE && !!window.meridian?.neuralInpaint);
+        setAsyncFill(true);
+        strokePersist = !d;
         applyStampToRGBBuffer(pixels, p.width, p.height, 4, texStamp);
+        strokePersist = false;
+        setAsyncFill(false);
         setNeuralEnabled(false);
+        drainFillJobs();
         drainNeuralJobs();
       }
       if (texRedEye.length) applyRedEyeToRGBBuffer(pixels, p.width, p.height, 4, texRedEye);
@@ -2255,6 +2468,7 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
       scale: tr && tr.sw ? p.width / tr.sw : 1,
     };
     scheduleDraw();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduleDraw]);
 
   /* Coalesced via requestAnimationFrame, same idea as scheduleDraw — a fast
@@ -2276,8 +2490,8 @@ function GLImage({ className, style, src, draggable, adjust, stamp, draft, redey
   }, [uploadTexture]);
 
   useEffect(() => {
-    neuralRedraws.add(scheduleUpload);
-    return () => { neuralRedraws.delete(scheduleUpload); };
+    fillRedraws.add(scheduleUpload);
+    return () => { fillRedraws.delete(scheduleUpload); };
   }, [scheduleUpload]);
 
   /* Decode `src` into a pristine pixel buffer once per unique URL. */
@@ -2329,6 +2543,8 @@ const TOOL_ICON = {
   clone: svgTool(<><circle cx="15" cy="9" r="5.3" strokeDasharray="2 2" opacity=".55"/><circle cx="10" cy="14" r="5.3"/></>),
   heal: svgTool(<><rect x="2.6" y="8.4" width="18.8" height="7.2" rx="3.6" transform="rotate(-45 12 12)"/><path d="M10.6 10.6h.01M13.4 13.4h.01M10.6 13.4h.01M13.4 10.6h.01" strokeWidth="2.4"/></>),
   remove: svgTool(<><path d="M8 20h12"/><path d="M5.3 14.7 13.6 6.4a2 2 0 0 1 2.8 0l3.2 3.2a2 2 0 0 1 0 2.8L12.4 19.6a1.4 1.4 0 0 1-1 .4H8.8a1.4 1.4 0 0 1-1-.4l-2.5-2.5a1.7 1.7 0 0 1 0-2.4z"/><path d="M9.5 10.5l4.9 4.9"/></>),
+  // auto straighten: a spirit level — the bubble centered between its marks
+  level: svgTool(<><rect x="2.5" y="8" width="19" height="8" rx="4"/><path d="M9.2 9.6v4.8M14.8 9.6v4.8"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/></>),
   redeye: svgTool(<><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3" fill="currentColor"/></>),
   wb: svgTool(<><path d="M14.5 4.5l5 5"/><path d="M17 7l2.6-2.6a1.9 1.9 0 0 0-2.7-2.7L14.3 4.3"/><path d="M15.5 8.5L6 18l-3 1 1-3 9.5-9.5"/></>),
   trash: svgTool(<><path d="M4 7h16"/><path d="M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/><path d="M6.5 7l.9 12a1.2 1.2 0 0 0 1.2 1.1h6.8a1.2 1.2 0 0 0 1.2-1.1l.9-12"/></>),
@@ -2603,12 +2819,19 @@ function distToSegment(px, py, ax, ay, bx, by) {
 }
 
 function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef, spaceRef, stampMode }) {
+  // reads the CURRENT view (viewRef), not the one this render closed over:
+  // a drag's window listeners keep the screenToImage of its pointerdown,
+  // and a wheel zoom mid-drag used to map the rest of the drag through the
+  // old zoom (the stroke ran ahead of / behind the pointer)
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const screenToImage = useCallback((clientX, clientY) => {
+    const v = viewRef.current;
     const box = stageRef.current.getBoundingClientRect();
     const sx = clientX - box.left, sy = clientY - box.top;
-    const [ux, uy] = irot(sx - view.icx, sy - view.icy, rad(view.theta));
-    return { x: ux / view.k + iw / 2, y: uy / view.k + ih / 2 };
-  }, [view, iw, stageRef]);
+    const [ux, uy] = irot(sx - v.icx, sy - v.icy, rad(v.theta));
+    return { x: ux / v.k + iw / 2, y: uy / v.k + ih / 2 };
+  }, [iw, stageRef]);
 
   const imageToLocal = useCallback((x, y) => {
     const [ox, oy] = rot(x - iw / 2, y - ih / 2, rad(view.theta));
@@ -2628,7 +2851,7 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
     const down = (ev) => {
       if (ev.code !== "Space" || ev.repeat) return;
       if (overlayRef.current) overlayRef.current.style.cursor = "grab";
-      hideCursor();
+      if (cursorRef.current) cursorRef.current.style.opacity = "0";
     };
     const up = (ev) => {
       if (ev.code !== "Space") return;
@@ -2655,23 +2878,40 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
      tiny incidental pointer movement, which otherwise reads as the brush
      cursor jittering around while the user is only trying to zoom. */
   const cursorRef = useRef(null);
-  const onOverlayMove = (e) => {
+  // last pointer position over the overlay (client px), null once it left
+  const pointerRef = useRef(null);
+  const placeCursor = (clientX, clientY, hideWhileGesturing) => {
     const el = cursorRef.current;
     if (!el) return;
-    if (spaceRef.current || gesturing) { el.style.opacity = "0"; return; }
+    if (spaceRef.current || (hideWhileGesturing && gesturing)) { el.style.opacity = "0"; return; }
     const box = stageRef.current.getBoundingClientRect();
-    const p = screenToImage(e.clientX, e.clientY);
+    const p = screenToImage(clientX, clientY);
     // hovering an existing stroke would grab+move it on click, not paint —
     // show a grab cursor and hide the brush-size circle there instead
     const overStroke = stamp.some((s) => nearestPointDist(s, p.x, p.y) <= s.radius);
     if (overlayRef.current) overlayRef.current.style.cursor = overStroke ? "grab" : "none";
     if (overStroke) { el.style.opacity = "0"; return; }
-    el.style.left = `${e.clientX - box.left - rect.x}px`;
-    el.style.top = `${e.clientY - box.top - rect.y}px`;
+    el.style.left = `${clientX - box.left - rect.x}px`;
+    el.style.top = `${clientY - box.top - rect.y}px`;
     el.style.opacity = "1";
   };
+  const onOverlayMove = (e) => {
+    pointerRef.current = { x: e.clientX, y: e.clientY };
+    placeCursor(e.clientX, e.clientY, true);
+  };
+  // The circle is placed inside the overlay, which moves and scales with
+  // the photo: a wheel/pinch zoom with the mouse standing still used to
+  // carry the circle away from the pointer (it only followed pointermove).
+  // Re-place it under the pointer after every zoom/pan step instead.
+  useLayoutEffect(() => {
+    const p = pointerRef.current;
+    if (p) placeCursor(p.x, p.y, false);
+    const d = dragRef.current;
+    if (d && d.ev) d.onMove(d.ev);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, rect]);
   const showCursor = () => { if (cursorRef.current && !spaceRef.current && !gesturing) cursorRef.current.style.opacity = "1"; };
-  const hideCursor = () => { if (cursorRef.current) cursorRef.current.style.opacity = "0"; };
+  const hideCursor = () => { pointerRef.current = null; if (cursorRef.current) cursorRef.current.style.opacity = "0"; };
 
   // The stroke currently being drawn/extended — kept OUT of `stamp` itself
   // until pointerup (undo/redo and persistence only ever see a finished
@@ -2708,11 +2948,17 @@ function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSel
     setStamp((prev) => prev.map((s, i) => (i === index ? { ...s, ...patch } : s)));
   };
 
+  // the drag in progress and its last pointer event — replayed when the
+  // view changes mid-drag (see the zoom layout effect), so what's being
+  // dragged stays under the pointer while a wheel zoom moves the photo
+  const dragRef = useRef(null);
   const beginWindowDrag = (onMove, onUp) => {
-    const move = (ev) => onMove(ev);
+    const drag = dragRef.current = { onMove, ev: null };
+    const move = (ev) => { drag.ev = ev; onMove(ev); };
     const up = (ev) => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      if (dragRef.current === drag) dragRef.current = null;
       if (onUp) onUp(ev);
     };
     window.addEventListener("pointermove", move);
@@ -3170,11 +3416,22 @@ const REDEYE_OUTLINE_STEPS = 48;
 function RedEyeOverlay({ redeye, setRedEye, selectedEye, setSelectedEye, snapshot, view, rect, iw, ih, stageRef, toast, editPixelsRef, spaceRef, newSize, newDarken }) {
   const [box, setBox] = useState(null); // in-progress drag, image px { x0, y0, x1, y1 }
 
+  // the current view, not the pointerdown render's (see StampOverlay's)
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  // a box drag in progress: re-run with its last pointer event when a
+  // wheel zoom changes the view, so the box corner stays under the pointer
+  const boxDragRef = useRef(null);
+  useLayoutEffect(() => {
+    const d = boxDragRef.current;
+    if (d) d.move(d.ev);
+  }, [view]);
   const screenToImage = useCallback((clientX, clientY) => {
+    const v = viewRef.current;
     const b = stageRef.current.getBoundingClientRect();
-    const [ux, uy] = irot(clientX - b.left - view.icx, clientY - b.top - view.icy, rad(view.theta));
-    return { x: ux / view.k + iw / 2, y: uy / view.k + ih / 2 };
-  }, [view, iw, ih, stageRef]);
+    const [ux, uy] = irot(clientX - b.left - v.icx, clientY - b.top - v.icy, rad(v.theta));
+    return { x: ux / v.k + iw / 2, y: uy / v.k + ih / 2 };
+  }, [iw, stageRef]);
   const imageToLocal = useCallback((x, y) => {
     const [ox, oy] = rot(x - iw / 2, y - ih / 2, rad(view.theta));
     return { left: view.icx + ox * view.k - rect.x, top: view.icy + oy * view.k - rect.y };
@@ -3218,12 +3475,14 @@ function RedEyeOverlay({ redeye, setRedEye, selectedEye, setSelectedEye, snapsho
     const move = (ev) => {
       if (!dragging && Math.hypot(ev.clientX - sx0, ev.clientY - sy0) < REDEYE_DRAG_MIN_PX) return;
       dragging = true;
+      boxDragRef.current = { move, ev };
       const p = screenToImage(ev.clientX, ev.clientY);
       setBox({ x0: p0.x, y0: p0.y, x1: p.x, y1: p.y });
     };
     const up = (ev) => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      boxDragRef.current = null;
       setBox(null);
       if (dragging) {
         const p = screenToImage(ev.clientX, ev.clientY);
@@ -3283,7 +3542,7 @@ function RedEyeOverlay({ redeye, setRedEye, selectedEye, setSelectedEye, snapsho
   );
 }
 
-function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport, filmstripHeight, onFilmstripResize }) {
+function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport, filmstripHeight, onFilmstripResize, aiMode, aiInfo, lamaDl, onAiMode }) {
   const stageRef = useRef(null);
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [rect, setRect] = useState(null);
@@ -4271,11 +4530,11 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     };
   }, [rect, view, iw, ih, stamp, redeye]);
 
-  const buildEdits = async () => {
+  const buildEdits = async (bg = null) => {
     const e = currentEdits();
     let preview = null;
     if (e) {
-      preview = await bakePreview(proxyURL(photo), iw, ih, e, 560);
+      preview = await bakePreview(proxyURL(photo), iw, ih, e, 560, bg);
     }
     cachePreviewToDisk(photo.path, preview);
     return [e, preview];
@@ -4291,15 +4550,28 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
      pre-adjustment data. */
   const autoCommitMounted = useRef(false);
   const autoCommitTimer = useRef(null);
+  // the preview is baked with background fills (bakePreview's bg): if a
+  // Remove stroke was left out, bake again once the fills land
+  const [rebakeTick, setRebakeTick] = useState(0);
+  const rebakeArmed = useRef(false);
+  useEffect(() => {
+    const onFill = () => { if (rebakeArmed.current && fillsInProgress() === 0) { rebakeArmed.current = false; setRebakeTick((t) => t + 1); } };
+    fillRedraws.add(onFill);
+    return () => { fillRedraws.delete(onFill); };
+  }, []);
   useEffect(() => {
     if (!autoCommitMounted.current) { autoCommitMounted.current = true; return undefined; }
     clearTimeout(autoCommitTimer.current);
     autoCommitTimer.current = setTimeout(() => {
-      buildEdits().then(([e, preview]) => onApply(e, preview));
+      const bg = {};
+      buildEdits(bg).then(([e, preview]) => {
+        onApply(e, preview);
+        if (bg.deferred) rebakeArmed.current = true;
+      });
     }, 500);
     return () => clearTimeout(autoCommitTimer.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [adjust, stamp, redeye]);
+  }, [adjust, stamp, redeye, rebakeTick]);
 
   /* Done / Enter: apply the crop, hide the crop UI, show the clean result */
   const apply = async () => {
@@ -4488,6 +4760,61 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const outW = rect && view ? Math.round(Math.min(iw, rect.w / view.k)) : 0;
   const outH = rect && view ? Math.round(Math.min(ih, rect.h / view.k)) : 0;
 
+  /* ---- Auto Straighten (crop HUD's Auto): Lightroom's Upright roll,
+     applied through the same applyRotation as the Straighten slider ---- */
+  const [straightening, setStraightening] = useState(false);
+  const autoStraighten = async () => {
+    if (straightening) return;
+    setStraightening(true);
+    try {
+      const angle = await autoStraightenPhoto(proxyURL(photo), rot90Steps, exif?.focal35);
+      if (angle == null) { toast("Nothing to level by — no clear verticals or horizon"); return; }
+      const fine = Math.round(angle * 100) / 100;
+      snapshot();
+      applyRotation(rot90Steps * 90 + fine);
+    } catch {
+      toast("Couldn't analyze the photo");
+    } finally {
+      setStraightening(false);
+    }
+  };
+
+  /* ---- AI for Remove ----
+     Picking Remove loads its networks in the background, so the first
+     stroke doesn't also wait for the load (LaMa ~4.5 s). */
+  useEffect(() => {
+    if (!NATIVE || mode !== "stamp" || stampMode !== "remove" || !aiMode || aiMode === "off") return;
+    window.meridian.neuralWarm("migan");
+    if (aiMode === "max" && aiInfo?.lamaReady) window.meridian.neuralWarm("lama");
+  }, [mode, stampMode, aiMode, aiInfo?.lamaReady]);
+  const fillsBusy = useFillsBusy();
+  const aiRecommend = aiInfo && aiInfo.cpus >= 8 && aiInfo.memGB >= 7.5 ? "max" : "fast";
+  const lamaMB = Math.round((aiInfo?.lamaBytes || 208e6) / 1e6);
+  // first time in Remove: ask before any network runs (null = never asked)
+  const aiPrompt = NATIVE && aiInfo && aiMode == null && mode === "stamp" && stampMode === "remove" && (
+    <div className="ai-card glass" role="dialog" aria-label="Use AI for Remove?">
+      <div className="ai-title">Use AI for Remove?</div>
+      <p className="ai-text">
+        A neural network rebuilds what was behind the removed area — shapes, edges, light — far better than the plain fill.
+        It runs on this computer (nothing is uploaded) and works in the background, a few seconds per stroke.
+      </p>
+      <div className="ai-opts">
+        {[
+          { key: "max", name: "Max quality", sub: aiInfo.lamaReady ? "MI-GAN + LaMa for big objects" : `MI-GAN + LaMa for big objects · one-time ${lamaMB} MB download` },
+          { key: "fast", name: "Fast", sub: "MI-GAN · included, quick on any computer" },
+          { key: "off", name: "No AI", sub: "Plain content-aware fill only" },
+        ].map((o) => (
+          <button key={o.key} className={`ai-opt ${o.key === aiRecommend ? "rec" : ""}`} onClick={() => onAiMode(o.key)}>
+            <span className="ai-opt-name">{o.name}{o.key === aiRecommend && <em>Recommended</em>}</span>
+            <span className="ai-opt-sub">{o.sub}</span>
+          </button>
+        ))}
+      </div>
+      <div className="ai-foot">You can change this anytime in the Remove toolbar.</div>
+    </div>
+  );
+  const fillPill = fillsBusy > 0 && <div className="fill-pill glass"><i className="spin" />Filling…</div>;
+
   /* ---- tool rail (left of the canvas) ----
      Same entry points as before: a tool starts only from view mode (what
      the old topbar buttons / S / E did), clicking the active tool applies
@@ -4604,7 +4931,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
           />)}
         {selStroke && (
           <div className="selchip">
-            <i className="sdot" />{STAMP_MODE_LABEL[selStroke.mode || "clone"]} stroke
+            <i className="sdot" /><span className="selchip-text">{STAMP_MODE_LABEL[selStroke.mode || "clone"]} stroke</span>
             <Tip text="Delete stroke (Delete)">
               <button
                 className="ib"
@@ -4622,6 +4949,30 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               <button className="ib" onClick={() => setSelectedStroke(null)} aria-label="Deselect stroke">{I.close}</button>
             </Tip>
           </div>
+        )}
+        {NATIVE && stampMode === "remove" && (
+          <>
+            <div className="hsep" />
+            <div className="ai-field">
+              <span className="ai-lab">
+                <span className="ai-name">{SPARKLE}AI fill</span>
+                <span className="ai-sub">
+                  {lamaDl ? `LaMa ${lamaDl.pct}%`
+                    : aiMode === "max" ? (aiInfo?.lamaReady ? "LaMa" : "MI-GAN")
+                    : aiMode === "fast" ? "MI-GAN" : "plain fill"}
+                </span>
+              </span>
+              <div className="hud-seg">
+                {AI_MODES.map((m) => (
+                  <Tip key={m.key} text={m.key === "max" && aiInfo && !aiInfo.lamaReady ? `${m.tip} · downloads ${lamaMB} MB once` : m.tip}>
+                    <button aria-pressed={(aiMode || "off") === m.key} onClick={() => onAiMode(m.key)}>
+                      {m.label}{m.key === "max" && aiInfo && !aiInfo.lamaReady && !lamaDl && " ↓"}
+                    </button>
+                  </Tip>
+                ))}
+              </div>
+            </div>
+          </>
         )}
         <div className="hsep" />
         {doneBtn}
@@ -4673,6 +5024,11 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             onDoubleClick={() => { snapshot(); applyRotation(rot90Steps * 90); }}
           />
         </div>
+        <Tip text="Auto — level the photo by its lines, like Lightroom's Auto straighten">
+          <button className="hud-btn auto-straighten" onClick={autoStraighten} disabled={straightening}>
+            {TOOL_ICON.level}{straightening ? "…" : "Auto"}
+          </button>
+        </Tip>
         <div className="hsep" />
         {doneBtn}
       </div>
@@ -4974,6 +5330,8 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       </div>
       {hudUI && <div className="hud-dock">{hudUI}</div>}
       {wbHud}
+      {aiPrompt}
+      {fillPill}
       </div>
       <div className="meta">
         <div className="side-tabs" role="tablist">
@@ -5363,6 +5721,12 @@ export default function App() {
   const [toastMsg, setToastMsg] = useState(null);
   const [watchedRoots, setWatchedRoots] = useState([]);
   const [theme, setTheme] = useState("dark");
+  // AI for Remove (see AI_MODES): null until the user has chosen; aiInfo is
+  // main's { cpus, memGB, lamaReady, lamaBytes }; lamaDl: { pct } while
+  // LaMa downloads
+  const [aiMode, setAiMode] = useState(null);
+  const [aiInfo, setAiInfo] = useState(null);
+  const [lamaDl, setLamaDl] = useState(null);
   const [presets, setPresets] = useState([]);      // export presets {id,name,format,targetMB,scale,dir}
   const [filmstripHeight, setFilmstripHeight] = useState(FILMSTRIP_MIN_H); // persisted like theme — see the settings load/save effects below
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MIN_W);         // persisted the same way — see the settings load/save effects below
@@ -5441,6 +5805,7 @@ export default function App() {
       if (Array.isArray(settings?.exportPresets)) setPresets(settings.exportPresets);
       if (typeof settings?.filmstripHeight === "number") setFilmstripHeight(clamp(settings.filmstripHeight, FILMSTRIP_MIN_H, FILMSTRIP_MAX_H));
       if (typeof settings?.sidebarWidth === "number") setSidebarWidth(clamp(settings.sidebarWidth, SIDEBAR_MIN_W, SIDEBAR_MAX_W));
+      if (AI_MODES.some((m) => m.key === settings?.aiMode)) setAiMode(settings.aiMode);
       setWatchedRoots(roots || []);
       setLibLoaded(true);
       if (missing > 0) toast(`${missing} photo${missing > 1 ? "s" : ""} removed — files no longer on disk`);
@@ -5511,10 +5876,39 @@ export default function App() {
     const t = setTimeout(() => {
       // previewUrl is a blob: URL scoped to this session — dead on restart
       const serializable = photos.map(({ url, previewUrl, ...rest }) => rest);
-      window.meridian.saveLibrary(serializable, { theme, exportPresets: presets, filmstripHeight, sidebarWidth });
+      window.meridian.saveLibrary(serializable, { theme, exportPresets: presets, filmstripHeight, sidebarWidth, aiMode });
     }, 400);
     return () => clearTimeout(t);
-  }, [photos, libLoaded, theme, presets, filmstripHeight, sidebarWidth]);
+  }, [photos, libLoaded, theme, presets, filmstripHeight, sidebarWidth, aiMode]);
+
+  /* ---- AI for Remove: mode → the fill code here and in main (export),
+     then re-render the fills with the new engine ---- */
+  useEffect(() => {
+    if (!NATIVE) return;
+    window.meridian.aiInfo().then(setAiInfo).catch(() => {});
+    return window.meridian.onLamaDownloadProgress(({ received, total }) => setLamaDl({ pct: Math.floor((received / total) * 100) }));
+  }, []);
+  useEffect(() => {
+    if (!NATIVE) return;
+    setNeuralMode(aiMode, !!aiInfo?.lamaReady);
+    window.meridian.aiSetMode(aiMode);
+    redrawFills();
+  }, [aiMode, aiInfo?.lamaReady]);
+  const chooseAiMode = useCallback(async (m) => {
+    setAiMode(m);
+    if (m !== "max" || aiInfo?.lamaReady || lamaDl) return;
+    // "Max" without LaMa yet: the click is the go-ahead for its download;
+    // MI-GAN covers every hole until it's in
+    setLamaDl({ pct: 0 });
+    const r = await window.meridian.downloadLama().catch((err) => ({ ok: false, error: String(err?.message || err) }));
+    setLamaDl(null);
+    if (r.ok) {
+      setAiInfo((i) => ({ ...i, lamaReady: true }));
+      toast("LaMa downloaded — Max quality is on");
+    } else {
+      toast(`Couldn't download LaMa (${r.error}) — using Fast until it's in. Click Max to retry.`);
+    }
+  }, [aiInfo, lamaDl, toast]);
 
   /* ---- import: native records [{path, name, folder}] ---- */
   const addNativeRecords = useCallback(async (records) => {
@@ -6150,6 +6544,10 @@ export default function App() {
           toast={toast}
           filmstripHeight={filmstripHeight}
           onFilmstripResize={setFilmstripHeight}
+          aiMode={aiMode}
+          aiInfo={aiInfo}
+          lamaDl={lamaDl}
+          onAiMode={chooseAiMode}
         />
       )}
 

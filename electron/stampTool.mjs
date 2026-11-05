@@ -167,7 +167,7 @@
      smooth), so the texture-preservation reasoning above still applies.
    ============================================================ */
 
-import { removeFill } from "./removeTool.mjs";
+import { removeFill, hashRegion, neuralState, neuralVersion } from "./removeTool.mjs";
 
 const DEFAULT_FEATHER = 0.3;      // default feather zone width, as a fraction of radius (Photoshop's brush "hardness", inverted)
 const DEFAULT_OPACITY = 1;        // default strength — 1 = fully replace, less = blend with the original (Photoshop's Opacity/Flow)
@@ -509,21 +509,24 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
   const reach = outer + ring;
   const ringR = heal ? Math.max(1, Math.round(radius * HEAL_RING_SMOOTH)) : 0;
 
-  const readMargin = reach + 1;
-  let rx0 = Infinity, ry0 = Infinity, rx1 = -Infinity, ry1 = -Infinity;
-  for (let i = 0; i < pts.length; i++) {
-    const sx = pts[i].x + dxs[i], sy = pts[i].y + dys[i];
-    rx0 = Math.min(rx0, pts[i].x - readMargin, sx - readMargin);
-    ry0 = Math.min(ry0, pts[i].y - readMargin, sy - readMargin);
-    rx1 = Math.max(rx1, pts[i].x + readMargin, sx + readMargin);
-    ry1 = Math.max(ry1, pts[i].y + readMargin, sy + readMargin);
-  }
-  rx0 = Math.max(0, Math.floor(rx0)); ry0 = Math.max(0, Math.floor(ry0));
-  rx1 = Math.min(width - 1, Math.ceil(rx1)); ry1 = Math.min(height - 1, Math.ceil(ry1));
+  const box = readBox(pts, dxs, dys, reach, width, height);
   // whole read footprint falls off-buffer (e.g. a stroke that's off-frame
   // in a cropped preview, or outside a deep-zoom tile's crop window) —
   // bail before allocating the snapshot below.
-  if (rx1 < rx0 || ry1 < ry0) return;
+  if (!box) return;
+  const [rx0, ry0, rx1, ry1] = box;
+  // same stroke over the same pixels as last time → write what it wrote
+  const cacheKey = strokeCacheKey(stroke, width, height, buf, channels, rx0, ry0, rx1, ry1);
+  // a Remove stroke still waiting for its network result is cached too,
+  // but only until the next result lands anywhere (neuralVersion)
+  const waitKey = stroke.mode === "remove" ? `${cacheKey}|nv${neuralVersion()}` : null;
+  const hitKey = strokeCache.has(cacheKey) ? cacheKey : waitKey && strokeCache.has(waitKey) ? waitKey : null;
+  const hit = hitKey && strokeCache.get(hitKey);
+  if (hit) {
+    strokeCache.delete(hitKey); strokeCache.set(hitKey, hit); // LRU: most recent last
+    replayStroke(hit, buf, channels);
+    return;
+  }
   const rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
   const snap = new Float32Array(rw * rh * 3);
   for (let y = 0; y < rh; y++) {
@@ -538,7 +541,12 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
   // segments = consecutive point pairs; a single-point stroke gets one
   // degenerate (zero-length) segment so the exact same math applies.
   const segCount = pts.length > 1 ? pts.length - 1 : 1;
-  const best = new Map();
+  // nearest segment per pixel, in flat arrays over the read box — a Map
+  // with an object per pixel per segment cost ~1 s per big stroke on every
+  // recomposite; the footprint Map below is built once, from the winners
+  const bestD = new Float64Array(rw * rh).fill(Infinity);
+  const bestDx = new Float32Array(rw * rh), bestDy = new Float32Array(rw * rh);
+  const reachSq = reach * reach;
   for (let s = 0; s < segCount; s++) {
     const i0 = s, i1 = pts.length > 1 ? s + 1 : 0;
     const ax = pts[i0].x, ay = pts[i0].y, bx = pts[i1].x, by = pts[i1].y;
@@ -547,22 +555,28 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     const sy0 = Math.max(0, Math.floor(Math.min(ay, by) - reach));
     const sy1 = Math.min(height - 1, Math.ceil(Math.max(ay, by) + reach));
     if (sx1 < sx0 || sy1 < sy0) continue;
+    // closestOnSegment, inlined
+    const abx = bx - ax, aby = by - ay, lenSq = abx * abx + aby * aby;
     for (let y = sy0; y <= sy1; y++) {
+      const row = (y - ry0) * rw - rx0;
       for (let x = sx0; x <= sx1; x++) {
-        const c = closestOnSegment(x, y, ax, ay, bx, by);
-        const dist = Math.hypot(x - c.x, y - c.y);
-        if (dist > reach) continue;
-        const key = y * width + x;
-        const prev = best.get(key);
-        if (prev && prev.dist <= dist) continue;
-        const t = c.t;
-        best.set(key, {
-          dist,
-          dx: dxs[i0] + (dxs[i1] - dxs[i0]) * t,
-          dy: dys[i0] + (dys[i1] - dys[i0]) * t,
-        });
+        let t = lenSq > 0 ? ((x - ax) * abx + (y - ay) * aby) / lenSq : 0;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const ex = x - (ax + abx * t), ey = y - (ay + aby * t);
+        const dSq = ex * ex + ey * ey;
+        if (dSq > reachSq) continue;
+        const i = row + x, dist = Math.sqrt(dSq);
+        if (bestD[i] <= dist) continue;
+        bestD[i] = dist;
+        bestDx[i] = dxs[i0] + (dxs[i1] - dxs[i0]) * t;
+        bestDy[i] = dys[i0] + (dys[i1] - dys[i0]) * t;
       }
     }
+  }
+  const best = new Map();
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const i = y * rw + x;
+    if (bestD[i] !== Infinity) best.set((y + ry0) * width + x + rx0, { dist: bestD[i], dx: bestDx[i], dy: bestDy[i] });
   }
 
   const healed = heal ? healSource(best, snap, rx0, ry0, rw, rh, width, outer, ringR) : null;
@@ -574,8 +588,12 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     for (const [key, v] of best) if (v.dist <= outer) holeKeys.push(key);
     const strokeKey = `${radius.toFixed(2)}|${feather}|${pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(";")}`;
     if (holeKeys.length) removed = removeFill(buf, width, height, channels, holeKeys, strokeKey);
+    // still being filled in the background (removeTool's setAsyncFill):
+    // leave the area as it is until the result lands and re-renders
+    if (!removed) return;
   }
 
+  const written = [];
   for (const [key, v] of best) {
     // ring pixels (heal only, dist > outer) land at alphaGeom 0 here and
     // are never written — they're read-only boundary samples
@@ -596,6 +614,67 @@ function applyStrokeToBuffer(buf, width, height, channels, stroke) {
     buf[o] = buf[o] * (1 - alpha) + sr * alpha;
     buf[o + 1] = buf[o + 1] * (1 - alpha) + sg * alpha;
     buf[o + 2] = buf[o + 2] * (1 - alpha) + sb * alpha;
+    written.push(key);
+  }
+  const keys = Int32Array.from(written), rgb = new Uint8Array(keys.length * 3);
+  for (let i = 0; i < keys.length; i++) {
+    const o = keys[i] * channels;
+    rgb[i * 3] = buf[o]; rgb[i * 3 + 1] = buf[o + 1]; rgb[i * 3 + 2] = buf[o + 2];
+  }
+  if (removed && !removed.final) strokeCachePut(waitKey, { keys, rgb }, false);
+  else strokeCachePut(cacheKey, { keys, rgb });
+}
+
+/* the box a stroke reads (footprint + heal ring + clone source), clamped
+   to the buffer; null when it's entirely off-buffer */
+function readBox(pts, dxs, dys, reach, width, height) {
+  const readMargin = reach + 1;
+  let rx0 = Infinity, ry0 = Infinity, rx1 = -Infinity, ry1 = -Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const sx = pts[i].x + dxs[i], sy = pts[i].y + dys[i];
+    rx0 = Math.min(rx0, pts[i].x - readMargin, sx - readMargin);
+    ry0 = Math.min(ry0, pts[i].y - readMargin, sy - readMargin);
+    rx1 = Math.max(rx1, pts[i].x + readMargin, sx + readMargin);
+    ry1 = Math.max(ry1, pts[i].y + readMargin, sy + readMargin);
+  }
+  rx0 = Math.max(0, Math.floor(rx0)); ry0 = Math.max(0, Math.floor(ry0));
+  rx1 = Math.min(width - 1, Math.ceil(rx1)); ry1 = Math.min(height - 1, Math.ceil(ry1));
+  return rx1 < rx0 || ry1 < ry0 ? null : [rx0, ry0, rx1, ry1];
+}
+function replayStroke(entry, buf, channels) {
+  for (let i = 0; i < entry.keys.length; i++) {
+    const o = entry.keys[i] * channels;
+    buf[o] = entry.rgb[i * 3]; buf[o + 1] = entry.rgb[i * 3 + 1]; buf[o + 2] = entry.rgb[i * 3 + 2];
+  }
+}
+
+/* Per-stroke output cache. A recomposite (every edit, every background
+   fill landing) re-applies ALL strokes; a stroke whose parameters and
+   underlying pixels (its whole read box: footprint, heal ring, clone
+   source) are unchanged writes exactly what it wrote before, so that's
+   replayed instead of recomputed (~300 ms → a few ms per big stroke).
+   Remove strokes are keyed with the AI mode, which changes their look,
+   and until final (see removeFill's `final`) also with neuralVersion. */
+const STROKE_CACHE_MAX_BYTES = 96 * 1024 * 1024;
+const strokeCache = new Map();
+let strokeCacheBytes = 0;
+function strokeCacheKey(stroke, width, height, buf, channels, rx0, ry0, rx1, ry1) {
+  const pts = stroke.points.map((p) => `${p.x},${p.y}${p.dx != null ? `,${p.dx},${p.dy}` : ""}`).join(";");
+  const ai = stroke.mode === "remove" ? neuralState() : "";
+  // buffer type too: a Uint8ClampedArray rounds the blend, a Buffer truncates it
+  return `${stroke.mode}|${stroke.radius}|${stroke.feather}|${stroke.opacity}|${stroke.dx},${stroke.dy}|${pts}|${width}x${height}x${channels}|${buf.constructor.name}|${ai}|${hashRegion(buf, width, channels, rx0, ry0, rx1, ry1)}`;
+}
+function strokeCachePut(key, entry, final = true) {
+  if (final && strokeCacheSink) strokeCacheSink(key, entry);
+  const old = strokeCache.get(key);
+  if (old) strokeCacheBytes -= old.keys.byteLength + old.rgb.byteLength;
+  strokeCache.delete(key);
+  strokeCache.set(key, entry);
+  strokeCacheBytes += entry.keys.byteLength + entry.rgb.byteLength;
+  for (const [k, e] of strokeCache) {
+    if (strokeCacheBytes <= STROKE_CACHE_MAX_BYTES) break;
+    strokeCache.delete(k);
+    strokeCacheBytes -= e.keys.byteLength + e.rgb.byteLength;
   }
 }
 
@@ -774,4 +853,56 @@ export function applyStampToRGBBuffer(buf, width, height, channels, stamp) {
     applyStrokeToBuffer(buf, width, height, channels, stroke);
   }
   return buf;
+}
+
+/* ---- persisting the stroke cache (renderer only) ----
+   A fresh app session has an empty stroke cache, so reopening a photo
+   with many Remove strokes used to redo all of them, in a chain (each
+   waits for the strokes under it). setStrokeCacheSink receives every final
+   stroke output (to store on disk); restoreStrokeCache walks a stroke
+   list over a copy of the pristine pixels, asking `load(key)` for each
+   stroke's stored output and replaying it, so its hash for the next
+   stroke is right — until the first one that isn't stored. After that, a
+   normal composite only computes what's actually missing. */
+let strokeCacheSink = null;
+export function setStrokeCacheSink(fn) { strokeCacheSink = fn; }
+export function packStrokeEntry(entry) {
+  const n = entry.keys.length, out = new Uint8Array(4 + n * 7);
+  new DataView(out.buffer).setUint32(0, n, true);
+  out.set(new Uint8Array(entry.keys.buffer, entry.keys.byteOffset, n * 4), 4);
+  out.set(entry.rgb, 4 + n * 4);
+  return out;
+}
+function unpackStrokeEntry(bytes) {
+  if (!bytes || bytes.length < 4) return null;
+  const n = new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getUint32(0, true);
+  if (bytes.length !== 4 + n * 7) return null;
+  const keys = new Int32Array(n);
+  new Uint8Array(keys.buffer).set(bytes.subarray(4, 4 + n * 4));
+  return { keys, rgb: bytes.slice(4 + n * 4) };
+}
+export async function restoreStrokeCache(buf, width, height, channels, stamp, load) {
+  let restored = 0;
+  for (const stroke of normalizeStamp(stamp)) {
+    const radius = stroke.radius, pts = stroke.points;
+    if (!(radius > 0) || !pts || !pts.length) continue;
+    const feather = Number.isFinite(stroke.feather) ? stroke.feather : DEFAULT_FEATHER;
+    const heal = stroke.mode === "heal";
+    const dxs = pts.map((p) => (heal ? stroke.dx : (p.dx ?? stroke.dx)));
+    const dys = pts.map((p) => (heal ? stroke.dy : (p.dy ?? stroke.dy)));
+    const outer = radius * (1 + feather);
+    const reach = outer + (heal ? Math.max(HEAL_RING_MIN, radius * HEAL_RING_FRAC) : 0);
+    const box = readBox(pts, dxs, dys, reach, width, height);
+    if (!box) continue;
+    const key = strokeCacheKey(stroke, width, height, buf, channels, ...box);
+    let entry = strokeCache.get(key);
+    if (!entry) {
+      entry = unpackStrokeEntry(await load(key));
+      if (!entry) break;
+      strokeCachePut(key, entry, false);
+      restored++;
+    }
+    replayStroke(entry, buf, channels);
+  }
+  return restored;
 }

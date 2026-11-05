@@ -18,6 +18,19 @@ contextBridge.exposeInMainWorld("meridian", {
   // local neural inpainting for the stamp tool's Remove mode (MI-GAN, runs
   // in the main process — electron/neuralFill.mjs); rgb/hole are Uint8Arrays
   neuralInpaint: (job) => ipcRenderer.invoke("neural-inpaint", job),
+  neuralWarm: (engine) => ipcRenderer.invoke("neural-warm", engine),
+  // disk cache for Remove fills (main.cjs) — key: string, bytes: Uint8Array
+  fillCacheGet: (key, len) => ipcRenderer.invoke("fill-cache-get", key, len),
+  fillCachePut: (key, bytes) => ipcRenderer.invoke("fill-cache-put", key, bytes),
+  // AI for Remove: opt-in mode, hardware hints, LaMa's one-time download
+  aiInfo: () => ipcRenderer.invoke("ai-info"),
+  aiSetMode: (mode) => ipcRenderer.invoke("ai-set-mode", mode),
+  downloadLama: () => ipcRenderer.invoke("lama-download"),
+  onLamaDownloadProgress: (cb) => {
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on("lama-download-progress", handler);
+    return () => ipcRenderer.removeListener("lama-download-progress", handler);
+  },
   onExportProgress: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("export-progress", handler);

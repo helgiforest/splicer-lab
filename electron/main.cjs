@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, dialog, protocol, net } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, protocol, net, utilityProcess } = require("electron");
+const os = require("os");
 const path = require("path");
 const fs = require("fs");
 const fsp = fs.promises;
@@ -26,13 +27,6 @@ function getColorAdjust() {
   return colorAdjustP;
 }
 
-/* stampTool.mjs — same ESM/dynamic-import rationale as colorAdjust.mjs */
-let stampToolP = null;
-function getStampTool() {
-  if (!stampToolP) stampToolP = import(pathToFileURL(path.join(__dirname, "stampTool.mjs")).href);
-  return stampToolP;
-}
-
 /* redEyeTool.mjs — same ESM/dynamic-import rationale as colorAdjust.mjs */
 let redEyeToolP = null;
 function getRedEyeTool() {
@@ -40,38 +34,151 @@ function getRedEyeTool() {
   return redEyeToolP;
 }
 
-/* removeTool.mjs (Remove mode's fill + neural job queue — the SAME module
-   instance stampTool.mjs imports, so jobs queued while compositing are
-   visible here) and neuralFill.mjs (MI-GAN on onnxruntime-web, local) —
-   same ESM/dynamic-import rationale as colorAdjust.mjs */
-let removeToolP = null;
-function getRemoveTool() {
-  if (!removeToolP) removeToolP = import(pathToFileURL(path.join(__dirname, "removeTool.mjs")).href);
-  return removeToolP;
+/* ---------------- AI for Remove ----------------
+   The networks (neuralFill.mjs) run in a utility process of their own
+   (neuralWorker.cjs), forked on first use — an inference blocks its thread
+   for up to seconds, which here in main would freeze every photo, tile and
+   thumbnail request meanwhile. Opt-in: the renderer sends the user's choice
+   ("off" | "fast" | "max", null = not asked yet = off) via ai-set-mode, and
+   LaMa (the "max" model, 208 MB) is downloaded only when the user picks it. */
+let aiMode = null;
+const LAMA_MODEL = {
+  url: "https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx",
+  size: 208044816,
+  sha256: "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6",
+};
+const lamaUserPath = () => path.join(app.getPath("userData"), "models", "lama_fp32.onnx");
+// a dev checkout may have it next to MI-GAN; never packaged (build.files)
+const lamaDevPath = path.join(__dirname, "models", "lama_fp32.onnx");
+const lamaReady = () => fs.existsSync(lamaUserPath()) || fs.existsSync(lamaDevPath);
+
+let neuralProc = null;
+let neuralSeq = 0;
+const neuralCalls = new Map();
+function neuralProcess() {
+  if (neuralProc) return neuralProc;
+  neuralProc = utilityProcess.fork(path.join(__dirname, "neuralWorker.cjs"), [], {
+    serviceName: "Splicer Lab AI",
+    env: { ...process.env, SPLICER_LAMA_PATH: lamaUserPath() },
+  });
+  neuralProc.on("message", (m) => {
+    const call = neuralCalls.get(m.id);
+    if (!call) return;
+    neuralCalls.delete(m.id);
+    if (m.ok) call.resolve(m.out); else call.reject(new Error(m.error));
+  });
+  neuralProc.on("exit", (code) => {
+    neuralProc = null;
+    for (const call of neuralCalls.values()) call.reject(new Error(`AI process exited (${code})`));
+    neuralCalls.clear();
+  });
+  return neuralProc;
 }
-let neuralFillP = null;
-function getNeuralFill() {
-  if (!neuralFillP) neuralFillP = import(pathToFileURL(path.join(__dirname, "neuralFill.mjs")).href);
-  return neuralFillP;
+function callNeural(msg) {
+  return new Promise((resolve, reject) => {
+    const id = ++neuralSeq;
+    neuralCalls.set(id, { resolve, reject });
+    neuralProcess().postMessage({ ...msg, id });
+  });
 }
 
-/* Runs every queued Remove-mode neural job (see removeTool.mjs) and stores
-   the results; returns how many ran. A failed inference is logged and
-   leaves that stroke on its PatchMatch-only fill. */
-async function runNeuralJobs() {
-  const { takeNeuralJobs, putNeuralResult } = await getRemoveTool();
-  const jobs = takeNeuralJobs();
-  if (!jobs.length) return 0;
-  const { neuralInpaint } = await getNeuralFill();
-  for (const j of jobs) {
-    try {
-      putNeuralResult(j.key, await neuralInpaint(j.rgb, j.hole, j.w, j.h, j.engine));
-    } catch (err) {
-      putNeuralResult(j.key, null);
-      appendLog(`[main] neural inpaint failed: ${err?.stack || err}`);
-    }
+/* Disk cache for Remove fills — PatchMatch crops (from the renderer's
+   worker) and network outputs — so reopening an edited photo, or zooming
+   into it again, doesn't recompute strokes that were already filled. Keys
+   are content keys (stroke geometry + crop + pixel hash, see removeTool's
+   removeFill), so an entry can only ever match the exact same input. LRU
+   by mtime, capped at FILL_CACHE_MAX_BYTES. */
+const FILL_CACHE_VERSION = 1; // bump when a fill's output for the same input changes
+const FILL_CACHE_MAX_BYTES = 512 * 1024 * 1024;
+const fillCacheDir = () => path.join(app.getPath("userData"), "fill-cache");
+const fillCacheFile = (key) => path.join(fillCacheDir(), crypto.createHash("sha1").update(`${FILL_CACHE_VERSION}|${key}`).digest("hex") + ".bin");
+async function fillCacheGet(key, len) {
+  try {
+    const file = fillCacheFile(key);
+    const buf = await fsp.readFile(file);
+    if (len && buf.length !== len) return null;
+    const now = new Date();
+    fsp.utimes(file, now, now).catch(() => {});
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
+  } catch {
+    return null;
   }
-  return jobs.length;
+}
+let fillCachePuts = 0;
+async function fillCachePut(key, bytes) {
+  try {
+    await fsp.mkdir(fillCacheDir(), { recursive: true });
+    const file = fillCacheFile(key);
+    await fsp.writeFile(file + ".tmp", bytes);
+    await fsp.rename(file + ".tmp", file);
+    if (fillCachePuts++ % 20 === 0) await pruneFillCache();
+  } catch {}
+}
+async function pruneFillCache() {
+  const dir = fillCacheDir();
+  const files = [];
+  for (const name of await fsp.readdir(dir)) {
+    try { const st = await fsp.stat(path.join(dir, name)); files.push({ name, size: st.size, mtime: st.mtimeMs }); } catch {}
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  let total = 0;
+  for (const f of files) {
+    total += f.size;
+    if (total > FILL_CACHE_MAX_BYTES) await fsp.rm(path.join(dir, f.name), { force: true });
+  }
+}
+
+/* One network fill (job: removeTool's neural job), through the disk cache. */
+async function neuralInpaintCached(job) {
+  const engine = job.engine === "lama" && !lamaReady() ? "migan" : job.engine;
+  const cacheKey = job.key && `nn|${engine}|${job.w}x${job.h}|${job.key}`;
+  if (cacheKey) {
+    const hit = await fillCacheGet(cacheKey, job.w * job.h * 3);
+    if (hit) return hit;
+  }
+  const out = await callNeural({ op: "inpaint", rgb: job.rgb, hole: job.hole, w: job.w, h: job.h, engine });
+  if (cacheKey && out) await fillCachePut(cacheKey, out);
+  return out;
+}
+
+/* LaMa, downloaded once into userData when the user picks "max": pinned
+   upstream revision, SHA-256 checked, written to .part and renamed, so a
+   cancelled or corrupt download never leaves a model that loads. Progress
+   goes to the window as lama-download-progress. */
+let lamaDownloadP = null;
+function downloadLama(sender) {
+  if (lamaReady()) return Promise.resolve(true);
+  if (lamaDownloadP) return lamaDownloadP;
+  lamaDownloadP = (async () => {
+    const dest = lamaUserPath(), tmp = dest + ".part";
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    // Chromium's network stack first (system proxy settings), Node's as a
+    // fallback where that one can't connect
+    let res;
+    try { res = await net.fetch(LAMA_MODEL.url); } catch { res = await fetch(LAMA_MODEL.url); }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const hash = crypto.createHash("sha256");
+    const out = fs.createWriteStream(tmp);
+    let received = 0, lastPct = -1;
+    try {
+      for await (const chunk of res.body) {
+        hash.update(chunk);
+        received += chunk.length;
+        if (!out.write(chunk)) await new Promise((r) => out.once("drain", r));
+        const pct = Math.floor((received / LAMA_MODEL.size) * 100);
+        if (pct !== lastPct && !sender.isDestroyed()) { lastPct = pct; sender.send("lama-download-progress", { received, total: LAMA_MODEL.size }); }
+      }
+    } finally {
+      await new Promise((r) => out.end(r));
+    }
+    if (received !== LAMA_MODEL.size || hash.digest("hex") !== LAMA_MODEL.sha256) {
+      await fsp.rm(tmp, { force: true });
+      throw new Error("the downloaded model failed its checksum");
+    }
+    await fsp.rename(tmp, dest);
+    return true;
+  })().finally(() => { lamaDownloadP = null; });
+  return lamaDownloadP;
 }
 
 /* ---------------- file logging ----------------
@@ -725,18 +832,15 @@ async function bakeRaw(item, scalePct) {
   // leftover `edits.fill` on an old photo is inert dead data now).
   const stampData = e && (e.stamp || e.heal);
   if (stampData && stampData.length) {
-    const { applyStampToRGBBuffer } = await getStampTool();
-    const hasRemove = stampData.some((s) => s && s.mode === "remove");
-    // Remove strokes: first pass queues their neural jobs (and fills with
-    // PatchMatch); run those, then composite again from the untouched
-    // pixels so every Remove stroke gets its neural+PatchMatch hybrid
-    const pristine = hasRemove ? Buffer.from(oriented.data) : null;
-    if (hasRemove) (await getRemoveTool()).setNeuralEnabled(true);
-    applyStampToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, stampData);
-    if (hasRemove && (await runNeuralJobs()) > 0) {
-      pristine.copy(oriented.data);
-      applyStampToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, stampData);
-    }
+    // in the AI utility process (neuralWorker.cjs's bakeStamp): PatchMatch,
+    // the networks and heal at full resolution take seconds, which here
+    // would freeze every other request until the export finished
+    const { data, info } = oriented;
+    const out = await callNeural({
+      op: "bakeStamp", data, width: info.width, height: info.height, channels: info.channels,
+      stamp: stampData, mode: aiMode, lamaReady: lamaReady(),
+    });
+    data.set(out);
   }
   // red eye: same frame as the stamp (original-image px, EXIF-oriented,
   // pre-rotate/crop), so stored entries apply as-is — no mapping needed
@@ -841,11 +945,36 @@ let tileGen = 0;
    engine: "migan" | "lama" } */
 ipcMain.handle("neural-inpaint", async (_e, job) => {
   try {
-    const { neuralInpaint } = await getNeuralFill();
-    return await neuralInpaint(job.rgb, job.hole, job.w, job.h, job.engine);
+    return await neuralInpaintCached(job);
   } catch (err) {
     appendLog(`[main] neural inpaint failed: ${err?.stack || err}`);
     return null;
+  }
+});
+ipcMain.handle("neural-warm", async (_e, engine) => {
+  try {
+    await callNeural({ op: "warm", engine: engine === "lama" ? "lama" : "migan" });
+    return true;
+  } catch (err) {
+    appendLog(`[main] neural warm-up failed: ${err?.stack || err}`);
+    return false;
+  }
+});
+ipcMain.handle("fill-cache-get", (_e, key, len) => fillCacheGet(String(key), len));
+ipcMain.handle("fill-cache-put", (_e, key, bytes) => fillCachePut(String(key), bytes));
+ipcMain.handle("ai-info", () => ({
+  cpus: (os.cpus() || []).length,
+  memGB: os.totalmem() / 2 ** 30,
+  lamaReady: lamaReady(),
+  lamaBytes: LAMA_MODEL.size,
+}));
+ipcMain.handle("ai-set-mode", (_e, mode) => { aiMode = ["off", "fast", "max"].includes(mode) ? mode : null; });
+ipcMain.handle("lama-download", async (e) => {
+  try {
+    return { ok: await downloadLama(e.sender) };
+  } catch (err) {
+    appendLog(`[main] LaMa download failed: ${err?.stack || err}`);
+    return { ok: false, error: String(err?.message || err) };
   }
 });
 
@@ -889,7 +1018,7 @@ ipcMain.handle("read-exif", async (_e, p) => {
   try {
     const exifr = require("exifr");
     const d = await exifr.parse(p, {
-      pick: ["Make", "Model", "LensModel", "ISO", "ExposureTime", "FNumber", "FocalLength", "DateTimeOriginal"],
+      pick: ["Make", "Model", "LensModel", "ISO", "ExposureTime", "FNumber", "FocalLength", "FocalLengthIn35mmFormat", "DateTimeOriginal"],
     });
     if (!d) return null;
     return {
@@ -900,6 +1029,8 @@ ipcMain.handle("read-exif", async (_e, p) => {
       exposure: d.ExposureTime || null,
       fnumber: d.FNumber || null,
       focal: d.FocalLength || null,
+      // 35 mm equivalent — Auto Straighten's camera model (electron/autoStraighten.mjs)
+      focal35: d.FocalLengthIn35mmFormat || null,
       taken: d.DateTimeOriginal ? new Date(d.DateTimeOriginal).getTime() : null,
     };
   } catch {

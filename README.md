@@ -12,7 +12,7 @@
 - **Develop module**: Temperature, Tint, Vibrance, Saturation, Exposure, Contrast, Highlights, Shadows, Whites, Blacks, plus Texture, Clarity and Dehaze — all live, all reversible, in collapsible sections with per-section reset. A white-balance eyedropper (`W`) sets Temperature and Tint from anything that should be neutral. A real-time histogram reflects the current crop and shows red clipping bars when the black or white point pushes pixels past 0% or 100%.
 - **Clone Stamp**: paint from any source point to duplicate or remove detail — a raw, pixel-for-pixel copy, exactly like Photoshop's real Clone Stamp, with no automatic color correction. Adjustable brush size, feather and opacity. Fully non-destructive — edit it again anytime.
 - **Heal**: like Clone Stamp, but the copied texture takes on the light and color around the spot, so blemishes, dust and small distractions vanish seamlessly. The source is found automatically, and re-searched whenever you change the stroke.
-- **Remove**: paint over something and it's rebuilt from the photo itself — no source point to pick. Local neural inpainting decides the shape and light (MI-GAN for ordinary spots, the larger LaMa for big objects), with grain matched to the photo around it. Runs fully offline on your machine.
+- **Remove**: paint over something and it's rebuilt from the photo itself — no source point to pick. Optional local AI decides the shape and light — you choose on first use: **Off** (content-aware fill only), **Fast** (MI-GAN, included) or **Max** (adds LaMa for big objects, a one-time 208 MB download) — with grain matched to the photo around it. Everything runs on your machine, in the background: the app stays responsive while a fill is computed, and finished fills are cached, so an edited photo reopens instantly.
 - **Red-eye removal**: drag a box around a red eye (or just click it) and the pupil is found and darkened naturally, with adjustable pupil size and darkness.
 - **Before/After**: hold Compare (or `\`) to see the untouched original in the exact same crop and framing, then let go to snap back to your edit.
 - **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5, flip any of them), rule-of-thirds grid, quarter-turn rotation (works from the viewer too, not just inside Crop), a fine ±45° leveling slider, deep-zoom sharpening for pixel-precise framing, full undo/redo.
@@ -104,7 +104,7 @@ Requires [Node.js](https://nodejs.org) 18+.
 ```bash
 git clone https://github.com/helgiforest/splicer-lab.git
 cd splicer-lab
-npm install        # also downloads the 208 MB LaMa model (too big for git)
+npm install
 npm start          # build & run
 npm run dist       # create the installer for your OS in release/
 ```
@@ -116,5 +116,5 @@ Tech: Electron + React + Vite; sharp/libvips with MozJPEG for encoding; dcraw (i
 ## Third-party components
 
 - **MI-GAN** inpainting model (`electron/models/migan_pipeline_v2.onnx`) — © 2024 Picsart AI Research, MIT License (code and weights), see `electron/models/LICENSE-MIGAN`.
-- **LaMa** inpainting model (`electron/models/lama_fp32.onnx`) — big-lama by Samsung AI Center (advimman/lama), ONNX port by Carve, Apache License 2.0, see `electron/models/LICENSE-LAMA`.
+- **LaMa** inpainting model (downloaded on demand from Carve/LaMa-ONNX into the app's data folder) — big-lama by Samsung AI Center (advimman/lama), ONNX port by Carve, Apache License 2.0, see `electron/models/LICENSE-LAMA`.
 - **ONNX Runtime Web** (`onnxruntime-web`) — © Microsoft Corporation, MIT License.

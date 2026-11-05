@@ -1,8 +1,10 @@
 /* ============================================================
-   Local neural inpainting for the stamp tool's Remove mode — runs in the
-   MAIN process only (electron/main.cjs): the renderer asks for it over IPC
-   ("neural-inpaint"), and the export path (bakeRaw) calls it directly.
-   Nothing leaves the machine: no network, no cloud.
+   Local neural inpainting for the stamp tool's Remove mode — runs in its
+   own utility process (electron/neuralWorker.cjs), never in the main
+   process: an inference blocks its thread for up to seconds (LaMa ~3.5 s,
+   plus ~4.5 s to load), which in main froze every photo/tile/thumbnail
+   request meanwhile. main.cjs proxies the renderer's "neural-inpaint" IPC
+   and the export path (bakeRaw) to it. Nothing leaves the machine.
 
    Model: MI-GAN (Sargsyan et al., Picsart AI Research, "MI-GAN: A Simple
    Baseline for Image Inpainting on Mobile Devices", ICCV 2023) — the
@@ -64,7 +66,10 @@ function session() {
    [1,3,512,512] + float32 mask [1,1,512,512] (1 = fill); output float32
    RGB 0..255. The crop is letterboxed into 512² (aspect kept; the margin
    is edge-replicated and marked KNOWN), and the result scaled back. */
-const LAMA_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "models", "lama_fp32.onnx");
+// downloaded on demand into userData (main.cjs passes the path in
+// SPLICER_LAMA_PATH); a dev checkout may also have it next to MI-GAN
+const LAMA_PATHS = [process.env.SPLICER_LAMA_PATH, path.join(path.dirname(fileURLToPath(import.meta.url)), "models", "lama_fp32.onnx")];
+const lamaPath = () => LAMA_PATHS.find((p) => p && fs.existsSync(p)) || null;
 const LAMA = 512;
 const LAMA_DILATE = 6; // mask growth, in 512-grid cells
 let lamaP = null;
@@ -72,7 +77,7 @@ function lamaSession() {
   if (!lamaP) {
     // MI-GAN's session first: it's what initializes the shared WASM runtime
     // (thread count, single-thread fallback)
-    lamaP = session().then(() => ort.InferenceSession.create(fs.readFileSync(LAMA_PATH)));
+    lamaP = session().then(() => ort.InferenceSession.create(fs.readFileSync(lamaPath())));
     lamaP.catch(() => { lamaP = null; });
   }
   return lamaP;
@@ -185,9 +190,8 @@ async function lamaRunSquare(rgb, hole, w, h) {
 let queue = Promise.resolve();
 export function neuralInpaint(rgb, hole, w, h, engine = "migan") {
   const job = queue.then(async () => {
-    // LaMa isn't in git (over GitHub's 100 MB limit) — scripts/fetch-models.mjs
-    // downloads it on npm install; a checkout without it falls back to MI-GAN
-    if (engine === "lama" && fs.existsSync(LAMA_PATH)) return lamaRun(rgb, hole, w, h);
+    // LaMa is an optional download (see main.cjs) — without it, MI-GAN
+    if (engine === "lama" && lamaPath()) return lamaRun(rgb, hole, w, h);
     const s = await session();
     const n = w * h;
     const planar = new Uint8Array(3 * n), mask = new Uint8Array(n);
@@ -206,4 +210,10 @@ export function neuralInpaint(rgb, hole, w, h, engine = "migan") {
   });
   queue = job.catch(() => {});
   return job;
+}
+
+/* Loads a model ahead of its first use (the Remove tool being picked), so
+   the first stroke doesn't also pay for the load (LaMa: ~4.5 s). */
+export function warm(engine) {
+  return engine === "lama" ? (lamaPath() ? lamaSession() : Promise.resolve()) : session();
 }

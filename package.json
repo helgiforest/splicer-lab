@@ -11,8 +11,7 @@
     "dist": "npm run build && electron-builder",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:win": "npm run build && electron-builder --win",
-    "dist:linux": "npm run build && electron-builder --linux",
-    "postinstall": "node scripts/fetch-models.mjs"
+    "dist:linux": "npm run build && electron-builder --linux"
   },
   "dependencies": {
     "dcraw": "^1.0.3",
@@ -35,6 +34,8 @@
     "files": [
       "dist/**",
       "electron/**",
+      "!electron/models/lama_fp32.onnx",
+      "!electron/models/*.part",
       "build/icon.png",
       "package.json"
     ],

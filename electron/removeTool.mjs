@@ -297,7 +297,7 @@ export function inpaint(img, w, h, hole, seed = 1) {
 
 /* ---- neural shape + matched grain (the hybrid) ----
    When a local neural fill for the same crop is available (MI-GAN or
-   LaMa, run by electron/neuralFill.mjs in the main process), the result is
+   LaMa, run by electron/neuralFill.mjs in its own utility process), the result is
      the network's fill  — the SHAPE: how a shadow, a wall, a fence
                            continues through the hole, which the network
                            gets right where patch copying can't; scaled to
@@ -315,7 +315,7 @@ export function inpaint(img, w, h, hole, seed = 1) {
    Neural inference is async and this function is sync, so it's two-step:
    without a result, this returns the PatchMatch fill and queues a job
    (takeNeuralJobs); whoever can run the network — GLImage over IPC, or
-   bakeRaw directly — does so, calls putNeuralResult, and re-renders. The
+   bakeRaw — does so, calls putNeuralResult, and re-renders. The
    job key is the same key the fill is cached under (stroke geometry +
    crop + pixel hash), so a result can only ever land on the exact pixels
    it was computed from. */
@@ -324,23 +324,44 @@ export function inpaint(img, w, h, hole, seed = 1) {
 // the hole covers more than this fraction of the buffer — a FRACTION, not
 // pixels, so the proxy preview and the full-res export pick the same one
 const LAMA_HOLE_FRACTION = 0.002;
-const neural = { enabled: false, results: new Map(), pending: new Map(), inflight: new Set() };
+// mode: the user's opt-in choice — "off" (PatchMatch only), "fast" (MI-GAN
+// for every hole) or "max" (LaMa for big holes once downloaded); null =
+// never asked = off. Results are keyed per engine (`${key}|${engine}`), so
+// switching modes re-renders with the right one instead of a stale result.
+const neural = { enabled: false, mode: null, lama: false, version: 0, results: new Map(), pending: new Map(), inflight: new Set(), failed: new Set() };
 const NEURAL_RESULTS_MAX = 32, NEURAL_PENDING_MAX = 16;
 
 /* Turn queuing on only where something will actually run the jobs. */
 export function setNeuralEnabled(on) { neural.enabled = !!on; }
+export function setNeuralMode(mode, lamaReady) { neural.mode = mode; neural.lama = !!lamaReady; neural.version++; }
+/* what a Remove stroke's final look depends on besides its pixels */
+export function neuralState() { return `${neural.mode}|${neural.lama}`; }
+/* bumped whenever a network result lands (or the mode changes): a stroke
+   still waiting for one may look different after it */
+export function neuralVersion() { return neural.version; }
+function engineFor(holePx, bufferPx) {
+  if (neural.mode === "fast") return "migan";
+  if (neural.mode === "max") return neural.lama && holePx / bufferPx > LAMA_HOLE_FRACTION ? "lama" : "migan";
+  return null;
+}
 export function takeNeuralJobs() {
   const jobs = [...neural.pending.values()];
   neural.pending.clear();
   for (const j of jobs) neural.inflight.add(j.key);
   return jobs;
 }
-/* rgb: Uint8Array w·h·3 (the network's output for job.key), or null on failure */
+/* rgb: Uint8Array w·h·3 (the network's output for job.key), or null on
+   failure — remembered, so a failing network isn't re-asked on every redraw */
 export function putNeuralResult(key, rgb) {
   neural.inflight.delete(key);
-  if (!rgb) return;
+  neural.version++;
+  if (!rgb) { neural.failed.add(key); return; }
   neural.results.set(key, rgb);
   if (neural.results.size > NEURAL_RESULTS_MAX) neural.results.delete(neural.results.keys().next().value);
+}
+/* how many Remove fills are still being computed (PatchMatch or network) */
+export function fillsInProgress() {
+  return fill.pending.size + fill.inflight.size + neural.pending.size + neural.inflight.size;
 }
 
 function sampleBilinear(src, w, h, fx, fy, out) {
@@ -371,8 +392,25 @@ const GRAIN_SD_MAX = 8;  // levels: grain, not texture — busy rings (foliage) 
    large values an edge in the ring contributes) */
 function robustSigma(vals) {
   if (!vals.length) return 0;
-  const a = Float32Array.from(vals, Math.abs).sort();
-  return 1.4826 * a[a.length >> 1];
+  const a = new Float32Array(vals.length);
+  for (let i = 0; i < a.length; i++) a[i] = Math.abs(vals[i]);
+  return 1.4826 * kthSmallest(a, a.length >> 1);
+}
+/* the k-th smallest value (what a[k] would be after a full sort), by
+   in-place quickselect — O(n) instead of sorting a whole big hole's worth */
+function kthSmallest(a, k) {
+  let lo = 0, hi = a.length - 1;
+  while (hi > lo) {
+    const pivot = a[(lo + hi) >> 1];
+    let i = lo, j = hi;
+    while (i <= j) {
+      while (a[i] < pivot) i++;
+      while (a[j] > pivot) j--;
+      if (i <= j) { const t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+    }
+    if (k <= j) hi = j; else if (k >= i) lo = i; else break;
+  }
+  return a[k];
 }
 
 /* base + synthetic grain matched to the grain just outside the hole (see
@@ -464,7 +502,7 @@ function addMatchedGrain(buf, width, height, channels, holeKeys, base, key) {
 const cache = new Map(); // key → { w, h, pm: crop (PatchMatch), input, hole, nnOut?: final colors with the neural fill }
 const CACHE_MAX = 32;
 
-function hashRegion(buf, width, channels, x0, y0, x1, y1) {
+export function hashRegion(buf, width, channels, x0, y0, x1, y1) {
   let h = 2166136261 >>> 0;
   const step = Math.max(1, Math.floor(((x1 - x0 + 1) * (y1 - y0 + 1)) / 4096));
   let k = 0;
@@ -478,6 +516,62 @@ function hashRegion(buf, width, channels, x0, y0, x1, y1) {
 
 /* `holeKeys`: buffer pixel indices (y·width + x) to fill. Returns
    Map(key → [r, g, b]). Reads `buf` only. */
+/* ---- PatchMatch in the background ----
+   PatchMatch takes up to ~2 s on a big stroke (M-series; slower PCs
+   several times that), so the on-screen composite doesn't run it inline:
+   with setAsyncFill(true) a cache miss queues a job (takeFillJobs) for a
+   Web Worker that runs `inpaint`, and putFillResult stores what it
+   returns. Export, thumbnails and the histogram stay synchronous. */
+// waiting: crops of this composite's strokes still being filled
+const fill = { async: false, waiting: [], pending: new Map(), inflight: new Map() };
+export function setAsyncFill(on) { fill.async = !!on; if (on) fill.waiting = []; }
+/* after a background-mode composite: did it leave any Remove stroke out? */
+export function fillDeferred() { return fill.waiting.length > 0; }
+export function takeFillJobs() {
+  const jobs = [...fill.pending.values()];
+  fill.pending.clear();
+  for (const j of jobs) fill.inflight.set(j.key, j);
+  return jobs;
+}
+/* pm: the filled crop (w·h·3 bytes, the job's own w/h), or null on failure */
+export function putFillResult(key, pm) {
+  const job = fill.inflight.get(key);
+  fill.inflight.delete(key);
+  if (job && pm && pm.length === job.w * job.h * 3) makeEntry(key, job.w, job.h, Uint8ClampedArray.from(pm), job.hole);
+}
+
+function seedOf(key) {
+  let seed = 2166136261;
+  for (let i = 0; i < key.length; i++) seed = Math.imul(seed ^ key.charCodeAt(i), 16777619);
+  return seed;
+}
+
+/* the work crop: hole pixels flagged, the rest averaged down by `s` */
+function fillCrop(buf, width, channels, holeKeys, cx0, cy0, cx1, cy1, s, w, h) {
+  const img = new Float32Array(w * h * 3), cnt = new Float32Array(w * h), hole = new Uint8Array(w * h);
+  const fw = cx1 - cx0 + 1, inHole = new Uint8Array(fw * (cy1 - cy0 + 1));
+  for (const k of holeKeys) { const x = k % width; inHole[((k - x) / width - cy0) * fw + x - cx0] = 1; }
+  for (let y = cy0; y <= cy1; y++) for (let x = cx0; x <= cx1; x++) {
+    const gx = Math.min(w - 1, Math.floor((x - cx0) * s)), gy = Math.min(h - 1, Math.floor((y - cy0) * s));
+    const g = gy * w + gx, o = (y * width + x) * channels;
+    if (inHole[(y - cy0) * fw + x - cx0]) { hole[g] = 1; continue; }
+    img[g * 3] += buf[o]; img[g * 3 + 1] += buf[o + 1]; img[g * 3 + 2] += buf[o + 2]; cnt[g]++;
+  }
+  for (let g = 0; g < w * h; g++) if (cnt[g]) { img[g * 3] /= cnt[g]; img[g * 3 + 1] /= cnt[g]; img[g * 3 + 2] /= cnt[g]; } else hole[g] = 1;
+  return { img, hole };
+}
+
+/* the network gets the PatchMatch-filled crop, not a crop with an empty
+   hole: MI-GAN's pipeline does NOT fully ignore pixels under the mask — a
+   black hole came back as a dark fill (center 45,49,32 where ~150,170,170
+   was right); any sensible first guess there gives ~1-level accuracy */
+function makeEntry(key, w, h, pm, hole) {
+  const entry = { w, h, pm, input: new Uint8Array(pm.buffer), hole, nnOut: {} };
+  cache.set(key, entry);
+  if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+  return entry;
+}
+
 export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (const key of holeKeys) {
@@ -496,33 +590,31 @@ export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
   const w = Math.max(1, Math.round(fw * s)), h = Math.max(1, Math.round(fh * s));
 
   let entry = cache.get(key);
-  if (!entry) {
-    const img = new Float32Array(w * h * 3), cnt = new Float32Array(w * h), hole = new Uint8Array(w * h);
-    const holeSet = new Set(holeKeys);
-    for (let y = cy0; y <= cy1; y++) for (let x = cx0; x <= cx1; x++) {
-      const gx = Math.min(w - 1, Math.floor((x - cx0) * s)), gy = Math.min(h - 1, Math.floor((y - cy0) * s));
-      const g = gy * w + gx, o = (y * width + x) * channels;
-      if (holeSet.has(y * width + x)) { hole[g] = 1; continue; }
-      img[g * 3] += buf[o]; img[g * 3 + 1] += buf[o + 1]; img[g * 3 + 2] += buf[o + 2]; cnt[g]++;
+  if (!entry && fill.async) {
+    // background mode (on-screen composite): never run PatchMatch here —
+    // queue it for the worker and leave this stroke unfilled until it
+    // lands. A stroke whose crop overlaps one that's still waiting waits
+    // too: its pixels will change once that one is filled, so computing
+    // it now would be wasted. Separate strokes are filled in parallel.
+    const overlaps = fill.waiting.some((r) => cx0 <= r[2] && r[0] <= cx1 && cy0 <= r[3] && r[1] <= cy1);
+    if (!overlaps && !fill.pending.has(key) && !fill.inflight.has(key)) {
+      const job = fillCrop(buf, width, channels, holeKeys, cx0, cy0, cx1, cy1, s, w, h);
+      fill.pending.set(key, { key, w, h, img: job.img, hole: job.hole, seed: seedOf(key) });
     }
-    for (let g = 0; g < w * h; g++) if (cnt[g]) { img[g * 3] /= cnt[g]; img[g * 3 + 1] /= cnt[g]; img[g * 3 + 2] /= cnt[g]; } else hole[g] = 1;
-    let seed = 2166136261;
-    for (let i = 0; i < key.length; i++) seed = Math.imul(seed ^ key.charCodeAt(i), 16777619);
-    inpaint(img, w, h, hole, seed);
-    // the network gets the PatchMatch-filled crop, not a crop with an empty
-    // hole: MI-GAN's pipeline does NOT fully ignore pixels under the mask —
-    // a black hole came back as a dark fill (center 45,49,32 where ~150,170,170
-    // was right); any sensible first guess there gives ~1-level accuracy
-    const pm = Uint8ClampedArray.from(img);
-    entry = { w, h, pm, input: new Uint8Array(pm.buffer), hole, nnOut: null };
-    cache.set(key, entry);
-    if (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value);
+    fill.waiting.push([cx0, cy0, cx1, cy1]);
+    return null;
+  }
+  if (!entry) {
+    const { img, hole } = fillCrop(buf, width, channels, holeKeys, cx0, cy0, cx1, cy1, s, w, h);
+    inpaint(img, w, h, hole, seedOf(key));
+    entry = makeEntry(key, w, h, Uint8ClampedArray.from(img), hole);
   }
 
-  const nn = neural.results.get(key);
-  if (!nn && neural.enabled && !neural.inflight.has(key) && !neural.pending.has(key)) {
-    const engine = holeKeys.length / (width * height) > LAMA_HOLE_FRACTION ? "lama" : "migan";
-    neural.pending.set(key, { key, w, h, rgb: entry.input, hole: entry.hole, engine });
+  const engine = engineFor(holeKeys.length, width * height);
+  const nkey = engine && `${key}|${engine}`;
+  const nn = engine ? neural.results.get(nkey) : null;
+  if (engine && !nn && neural.enabled && !neural.inflight.has(nkey) && !neural.pending.has(nkey) && !neural.failed.has(nkey)) {
+    neural.pending.set(nkey, { key: nkey, w, h, rgb: entry.input, hole: entry.hole, engine });
     if (neural.pending.size > NEURAL_PENDING_MAX) neural.pending.delete(neural.pending.keys().next().value);
   }
 
@@ -535,12 +627,15 @@ export function removeFill(buf, width, height, channels, holeKeys, strokeKey) {
     sampleBilinear(src, w, h, (x - cx0 + 0.5) * s - 0.5, (y - cy0 + 0.5) * s - 0.5, px);
     base[idx * 3] = px[0]; base[idx * 3 + 1] = px[1]; base[idx * 3 + 2] = px[2];
   });
-  if (nn && !entry.nnOut) entry.nnOut = addMatchedGrain(buf, width, height, channels, holeKeys, base, key);
-  const final = nn ? entry.nnOut : base;
+  if (nn && !entry.nnOut[engine]) entry.nnOut[engine] = addMatchedGrain(buf, width, height, channels, holeKeys, base, key);
+  const final = nn ? entry.nnOut[engine] : base;
 
   const out = new Map();
   holeKeys.forEach((k, idx) => {
     out.set(k, [Math.round(final[idx * 3]), Math.round(final[idx * 3 + 1]), Math.round(final[idx * 3 + 2])]);
   });
+  // final = nothing better is coming for this exact input (no network
+  // result still to land) — only then may the caller cache what it drew
+  out.final = !engine || !!nn;
   return out;
 }
